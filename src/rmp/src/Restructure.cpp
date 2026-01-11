@@ -203,7 +203,13 @@ Restructure::PathNode* Restructure::buildPathTree(
     int current_depth,
     const ConeSelectionConfig& config) {
   
-  if (!vertex || current_depth >= config.max_cone_depth) {
+  if (!vertex) {
+    debugPrint(logger_, RMP, "remap", 1, "Null vertex at depth {}", current_depth);
+    return nullptr;
+  }
+  
+  if (current_depth >= config.max_cone_depth) {
+    debugPrint(logger_, RMP, "remap", 1, "Reached max depth {}", current_depth);
     return nullptr;
   }
   
@@ -214,9 +220,18 @@ Restructure::PathNode* Restructure::buildPathTree(
   node->slack = getVertexSlack(vertex);
   node->depth = current_depth;
   
+  debugPrint(logger_, RMP, "remap", 1, 
+             "Building node at depth {}: {} (arrival: {}, slack: {})",
+             current_depth,
+             open_sta_->getDbNetwork()->pathName(vertex->pin()),
+             node->arrival_time,
+             node->slack);
+  
   // 获取fanin edges
   sta::VertexInEdgeIterator edge_iter(vertex, open_sta_->graph());
   std::vector<sta::Vertex*> fanins;
+  int skipped_ports = 0;
+  int skipped_seq = 0;
   
   while (edge_iter.hasNext()) {
     sta::Edge* edge = edge_iter.next();
@@ -224,17 +239,23 @@ Restructure::PathNode* Restructure::buildPathTree(
     
     // 跳过端口和sequential元素
     if (open_sta_->getDbNetwork()->isTopLevelPort(from_vertex->pin())) {
+      skipped_ports++;
       continue;
     }
     
     sta::LibertyCell* cell = open_sta_->getDbNetwork()->libertyCell(
         open_sta_->getDbNetwork()->instance(from_vertex->pin()));
     if (cell && cell->hasSequentials()) {
+      skipped_seq++;
       continue;
     }
     
     fanins.push_back(from_vertex);
   }
+  
+  debugPrint(logger_, RMP, "remap", 1,
+             "Found {} fanins (skipped {} ports, {} sequential)",
+             fanins.size(), skipped_ports, skipped_seq);
   
   // 递归构建子节点(最多取2个最差的fanin)
   if (!fanins.empty()) {
@@ -244,6 +265,9 @@ Restructure::PathNode* Restructure::buildPathTree(
                 return getVertexArrivalTime(a) > getVertexArrivalTime(b);
               });
     
+    debugPrint(logger_, RMP, "remap", 1,
+               "Recursing into {} fanin(s)", std::min(2, (int)fanins.size()));
+    
     // 构建左子节点(最差的fanin)
     node->left_child = buildPathTree(fanins[0], current_depth + 1, config);
     
@@ -251,6 +275,8 @@ Restructure::PathNode* Restructure::buildPathTree(
     if (fanins.size() > 1) {
       node->right_child = buildPathTree(fanins[1], current_depth + 1, config);
     }
+  } else {
+    debugPrint(logger_, RMP, "remap", 1, "No valid fanins, stopping here");
   }
   
   return node;
@@ -305,6 +331,9 @@ void Restructure::selectNodesFromTree(
     int& current_size) {
   
   if (!node || current_size >= config.max_cone_size) {
+    debugPrint(logger_, RMP, "remap", 1,
+               "Stopping: node={}, size={}/{}", 
+               (void*)node, current_size, config.max_cone_size);
     return;
   }
   
@@ -313,25 +342,35 @@ void Restructure::selectNodesFromTree(
   selected_vertices.insert(node->vertex);
   current_size++;
   
+  debugPrint(logger_, RMP, "remap", 1,
+             "Selected vertex {} (total: {})",
+             open_sta_->getDbNetwork()->pathName(node->pin),
+             current_size);
+  
   // 检查是否有子节点
   if (!node->left_child && !node->right_child) {
+    debugPrint(logger_, RMP, "remap", 1, "Leaf node, stopping");
     return;  // 叶子节点,停止
   }
   
   // 判断子节点的延迟改善潜力
   float parent_slack = std::abs(node->slack);
   
-  // 如果当前节点的slack已经很好,停止递归
-  if (parent_slack < config.min_improvement_threshold) {
-    debugPrint(logger_, RMP, "remap", 2,
-               "Stopping at node with slack {}, below threshold {}",
-               parent_slack, config.min_improvement_threshold);
-    return;
-  }
+  // 注释掉 slack 阈值检查,让它继续选择
+  // if (parent_slack < config.min_improvement_threshold) {
+  //   debugPrint(logger_, RMP, "remap", 2,
+  //              "Stopping at node with slack {}, below threshold {}",
+  //              parent_slack, config.min_improvement_threshold);
+  //   return;
+  // }
   
   // 判断是否应该选择两个子节点
   bool select_both = shouldSelectChild(node, node->left_child, 
                                        node->right_child, config);
+  
+  debugPrint(logger_, RMP, "remap", 1,
+             "Has children: left={}, right={}, select_both={}",
+             (void*)node->left_child, (void*)node->right_child, select_both);
   
   if (select_both) {
     // 两个子节点延迟差异不大,都选择
@@ -375,6 +414,12 @@ void Restructure::selectNodesFromTree(
       
       debugPrint(logger_, RMP, "remap", 2,
                  "Better child marked as boundary, not recursing");
+    } else if (node->left_child) {
+      // 只有左子节点
+      selectNodesFromTree(node->left_child, config, selected_vertices, current_size);
+    } else if (node->right_child) {
+      // 只有右子节点
+      selectNodesFromTree(node->right_child, config, selected_vertices, current_size);
     }
   }
 }

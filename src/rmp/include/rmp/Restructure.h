@@ -105,6 +105,7 @@ class Restructure
     bool selected;
     bool is_boundary;
     
+    
     PathNode() : vertex(nullptr), pin(nullptr), arrival_time(0.0), 
                  slack(0.0), depth(0), left_child(nullptr), 
                  right_child(nullptr), selected(false), is_boundary(false) {}
