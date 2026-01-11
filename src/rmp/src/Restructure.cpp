@@ -137,6 +137,290 @@ void Restructure::run(char* liberty_file_name,
   }
 }
 
+void Restructure::selectConeByPathDelay(const ConeSelectionConfig& config) {
+  open_sta_->ensureGraph();
+  open_sta_->ensureLevelized();
+  open_sta_->searchPreamble();
+  
+  auto sta_state = open_sta_->search();
+  sta::VertexSet* end_points = sta_state->endpoints();
+  
+  logger_->report("Starting smart cone selection from {} endpoints", 
+                  end_points->size());
+  
+  std::set<sta::Vertex*> all_selected_vertices;
+  
+  // 找到 worst slack 的 endpoint
+  sta::Vertex* worst_endpoint = nullptr;
+  sta::Slack worst_slack = std::numeric_limits<float>::max();
+  
+  for (auto& end_point : *end_points) {
+    sta::Slack slack = open_sta_->vertexSlack(end_point, sta::MinMax::max());
+    if (slack < worst_slack) {
+      worst_slack = slack;
+      worst_endpoint = end_point;
+    }
+  }
+  
+  if (!worst_endpoint) {
+    logger_->warn(RMP, 12, "No endpoint found for cone selection");
+    return;
+  }
+  
+  logger_->report("Selecting worst endpoint with slack: {}", worst_slack);
+  logger_->report("Building path tree for endpoint: {}", 
+                  open_sta_->getDbNetwork()->pathName(worst_endpoint->pin()));
+  
+  // 构建路径树
+  PathNode* root = buildPathTree(worst_endpoint, 0, config);
+  
+  if (root) {
+    // 从树中选择节点
+    std::set<sta::Vertex*> selected_vertices;
+    int current_size = 0;
+    selectNodesFromTree(root, config, selected_vertices, current_size);
+    
+    logger_->report("Selected {} vertices from this endpoint", 
+                    selected_vertices.size());
+    
+    // 合并到总的选择集合
+    all_selected_vertices.insert(selected_vertices.begin(), 
+                                 selected_vertices.end());
+    
+    // 清理树
+    cleanupPathTree(root);
+  }
+  
+  // 收集选中的instances
+  collectSelectedInstances(all_selected_vertices);
+  
+  logger_->report("Total selected {} instances for restructuring", 
+                  path_insts_.size());
+}
+
+Restructure::PathNode* Restructure::buildPathTree(
+    sta::Vertex* vertex,
+    int current_depth,
+    const ConeSelectionConfig& config) {
+  
+  if (!vertex || current_depth >= config.max_cone_depth) {
+    return nullptr;
+  }
+  
+  PathNode* node = new PathNode();
+  node->vertex = vertex;
+  node->pin = vertex->pin();
+  node->arrival_time = getVertexArrivalTime(vertex);
+  node->slack = getVertexSlack(vertex);
+  node->depth = current_depth;
+  
+  // 获取fanin edges
+  sta::VertexInEdgeIterator edge_iter(vertex, open_sta_->graph());
+  std::vector<sta::Vertex*> fanins;
+  
+  while (edge_iter.hasNext()) {
+    sta::Edge* edge = edge_iter.next();
+    sta::Vertex* from_vertex = edge->from(open_sta_->graph());
+    
+    // 跳过端口和sequential元素
+    if (open_sta_->getDbNetwork()->isTopLevelPort(from_vertex->pin())) {
+      continue;
+    }
+    
+    sta::LibertyCell* cell = open_sta_->getDbNetwork()->libertyCell(
+        open_sta_->getDbNetwork()->instance(from_vertex->pin()));
+    if (cell && cell->hasSequentials()) {
+      continue;
+    }
+    
+    fanins.push_back(from_vertex);
+  }
+  
+  // 递归构建子节点(最多取2个最差的fanin)
+  if (!fanins.empty()) {
+    // 按arrival time排序,取延迟最大的
+    std::sort(fanins.begin(), fanins.end(), 
+              [this](sta::Vertex* a, sta::Vertex* b) {
+                return getVertexArrivalTime(a) > getVertexArrivalTime(b);
+              });
+    
+    // 构建左子节点(最差的fanin)
+    node->left_child = buildPathTree(fanins[0], current_depth + 1, config);
+    
+    // 如果有第二个fanin,构建右子节点
+    if (fanins.size() > 1) {
+      node->right_child = buildPathTree(fanins[1], current_depth + 1, config);
+    }
+  }
+  
+  return node;
+}
+
+float Restructure::calculateDelayGap(PathNode* left, PathNode* right) {
+  if (!left || !right) {
+    return std::numeric_limits<float>::max();
+  }
+  
+  // 计算两个子节点的arrival time差异
+  float gap = std::abs(left->arrival_time - right->arrival_time);
+  
+  // 归一化:相对于较大的arrival time
+  float max_arrival = std::max(left->arrival_time, right->arrival_time);
+  if (max_arrival > 0) {
+    return gap / max_arrival;
+  }
+  
+  return gap;
+}
+
+bool Restructure::shouldSelectChild(PathNode* parent,
+                                     PathNode* left,
+                                     PathNode* right,
+                                     const ConeSelectionConfig& config) {
+  if (!parent) {
+    return false;
+  }
+  
+  // 如果只有一个子节点,直接选择
+  if (!left || !right) {
+    return true;
+  }
+  
+  // 计算延迟差异比例
+  float delay_gap = calculateDelayGap(left, right);
+  
+  // 如果差异大于阈值,只选择较差的那个
+  if (delay_gap > config.delay_threshold_ratio) {
+    return false;  // 返回false表示只选一个
+  }
+  
+  // 差异小,两个都选
+  return true;
+}
+
+void Restructure::selectNodesFromTree(
+    PathNode* node,
+    const ConeSelectionConfig& config,
+    std::set<sta::Vertex*>& selected_vertices,
+    int& current_size) {
+  
+  if (!node || current_size >= config.max_cone_size) {
+    return;
+  }
+  
+  // 选择当前节点
+  node->selected = true;
+  selected_vertices.insert(node->vertex);
+  current_size++;
+  
+  // 检查是否有子节点
+  if (!node->left_child && !node->right_child) {
+    return;  // 叶子节点,停止
+  }
+  
+  // 判断子节点的延迟改善潜力
+  float parent_slack = std::abs(node->slack);
+  
+  // 如果当前节点的slack已经很好,停止递归
+  if (parent_slack < config.min_improvement_threshold) {
+    debugPrint(logger_, RMP, "remap", 2,
+               "Stopping at node with slack {}, below threshold {}",
+               parent_slack, config.min_improvement_threshold);
+    return;
+  }
+  
+  // 判断是否应该选择两个子节点
+  bool select_both = shouldSelectChild(node, node->left_child, 
+                                       node->right_child, config);
+  
+  if (select_both) {
+    // 两个子节点延迟差异不大,都选择
+    if (node->left_child) {
+      debugPrint(logger_, RMP, "remap", 2,
+                 "Selecting both children, delay gap is small");
+      selectNodesFromTree(node->left_child, config, 
+                         selected_vertices, current_size);
+    }
+    if (node->right_child) {
+      selectNodesFromTree(node->right_child, config, 
+                         selected_vertices, current_size);
+    }
+  } else {
+    // 差异大,只选择较差的那个继续递归
+    PathNode* worse_child = nullptr;
+    PathNode* better_child = nullptr;
+    
+    if (node->left_child && node->right_child) {
+      if (node->left_child->arrival_time > node->right_child->arrival_time) {
+        worse_child = node->left_child;
+        better_child = node->right_child;
+      } else {
+        worse_child = node->right_child;
+        better_child = node->left_child;
+      }
+      
+      debugPrint(logger_, RMP, "remap", 2,
+                 "Large delay gap detected, selecting worse path only. "
+                 "Gap: {:.2%}", 
+                 calculateDelayGap(node->left_child, node->right_child));
+      
+      // 较差的子节点:继续递归
+      selectNodesFromTree(worse_child, config, selected_vertices, current_size);
+      
+      // 较好的子节点:标记为边界,选中但不递归
+      better_child->selected = true;
+      better_child->is_boundary = true;
+      selected_vertices.insert(better_child->vertex);
+      current_size++;
+      
+      debugPrint(logger_, RMP, "remap", 2,
+                 "Better child marked as boundary, not recursing");
+    }
+  }
+}
+
+void Restructure::collectSelectedInstances(
+    const std::set<sta::Vertex*>& vertices) {
+  
+  path_insts_.clear();
+  
+  for (sta::Vertex* vertex : vertices) {
+    sta::Pin* pin = vertex->pin();
+    
+    odb::dbITerm* term = nullptr;
+    odb::dbBTerm* port = nullptr;
+    odb::dbModITerm* moditerm = nullptr;
+    open_sta_->getDbNetwork()->staToDb(pin, term, port, moditerm);
+    
+    if (term) {
+      odb::dbInst* inst = term->getInst();
+      if (inst && !inst->getMaster()->isBlock()) {
+        path_insts_.insert(inst);
+      }
+    }
+  }
+}
+
+void Restructure::cleanupPathTree(PathNode* node) {
+  if (!node) {
+    return;
+  }
+  
+  cleanupPathTree(node->left_child);
+  cleanupPathTree(node->right_child);
+  delete node;
+}
+
+float Restructure::getVertexArrivalTime(sta::Vertex* vertex) {
+  sta::Arrival arrival = open_sta_->vertexArrival(vertex, sta::MinMax::max());
+  return sta::delayAsFloat(arrival);
+}
+
+float Restructure::getVertexSlack(sta::Vertex* vertex) {
+  sta::Slack slack = open_sta_->vertexSlack(vertex, sta::MinMax::max());
+  return sta::delayAsFloat(slack);
+}
+
 void Restructure::getBlob(unsigned max_depth)
 {
   open_sta_->ensureGraph();
@@ -146,22 +430,33 @@ void Restructure::getBlob(unsigned max_depth)
   sta::PinSet ends(open_sta_->getDbNetwork());
 
   getEndPoints(ends, is_area_mode_, max_depth);
+  
   if (!ends.empty()) {
-    sta::PinSet boundary_points = !is_area_mode_
-                                      ? resizer_->findFanins(ends)
-                                      : resizer_->findFaninFanouts(ends);
-    // fanin_fanouts.insert(ends.begin(), ends.end()); // Add seq cells
-    logger_->report("Found {} pins in extracted logic.",
-                    boundary_points.size());
-    for (const sta::Pin* pin : boundary_points) {
-      odb::dbITerm* term = nullptr;
-      odb::dbBTerm* port = nullptr;
-      odb::dbModITerm* moditerm = nullptr;
-      open_sta_->getDbNetwork()->staToDb(pin, term, port, moditerm);
-      if (term && !term->getInst()->getMaster()->isBlock()) {
-        path_insts_.insert(term->getInst());
+    if (is_area_mode_) {
+      sta::PinSet boundary_points = resizer_->findFaninFanouts(ends);
+      logger_->report("Found {} pins in extracted logic.",
+                      boundary_points.size());
+      
+      for (const sta::Pin* pin : boundary_points) {
+        odb::dbITerm* term = nullptr;
+        odb::dbBTerm* port = nullptr;
+        odb::dbModITerm* moditerm = nullptr;
+        open_sta_->getDbNetwork()->staToDb(pin, term, port, moditerm);
+        
+        if (term && !term->getInst()->getMaster()->isBlock()) {
+          path_insts_.insert(term->getInst());
+        }
       }
+    } else {
+      ConeSelectionConfig config;
+      config.max_cone_depth = max_depth;
+      config.delay_threshold_ratio = 0.3;     
+      config.max_cone_size = 500;              
+      config.min_improvement_threshold = 0.05; 
+
+      selectConeByPathDelay(config);
     }
+
     logger_->report("Found {} instances for restructuring.",
                     path_insts_.size());
   }

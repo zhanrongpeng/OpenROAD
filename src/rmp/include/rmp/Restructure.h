@@ -94,6 +94,54 @@ class Restructure
   void setTieHiPort(sta::LibertyPort* hiport);
 
  private:
+  struct PathNode {
+    sta::Vertex* vertex;
+    sta::Pin* pin;
+    float arrival_time;
+    float slack;
+    int depth;
+    PathNode* left_child;
+    PathNode* right_child;
+    bool selected;
+    bool is_boundary;
+    
+    PathNode() : vertex(nullptr), pin(nullptr), arrival_time(0.0), 
+                 slack(0.0), depth(0), left_child(nullptr), 
+                 right_child(nullptr), selected(false), is_boundary(false) {}
+  };
+  
+  struct ConeSelectionConfig {
+    float delay_threshold_ratio;
+    int max_cone_depth;
+    int max_cone_size;
+    float min_improvement_threshold;
+    
+    ConeSelectionConfig() 
+      : delay_threshold_ratio(0.3),
+        max_cone_depth(15),
+        max_cone_size(500),
+        min_improvement_threshold(0.05) {}
+  };
+
+  // 智能 cone 选择方法
+  void selectConeByPathDelay(const ConeSelectionConfig& config);
+  PathNode* buildPathTree(sta::Vertex* vertex, 
+                          int current_depth,
+                          const ConeSelectionConfig& config);
+  bool shouldSelectChild(PathNode* parent,
+                         PathNode* left,
+                         PathNode* right,
+                         const ConeSelectionConfig& config);
+  float calculateDelayGap(PathNode* left, PathNode* right);
+  void selectNodesFromTree(PathNode* root, 
+                           const ConeSelectionConfig& config,
+                           std::set<sta::Vertex*>& selected_vertices,
+                           int& current_size);
+  void collectSelectedInstances(const std::set<sta::Vertex*>& vertices);
+  void cleanupPathTree(PathNode* node);
+  float getVertexArrivalTime(sta::Vertex* vertex);
+  float getVertexSlack(sta::Vertex* vertex);
+
   void deleteComponents();
   void getBlob(unsigned max_depth);
   void runABC();
