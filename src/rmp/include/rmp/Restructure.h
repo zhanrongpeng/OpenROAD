@@ -100,28 +100,33 @@ class Restructure
     float arrival_time;
     float slack;
     int depth;
+    float x;  // X coordinate
+    float y;  // Y coordinate
     PathNode* left_child;
     PathNode* right_child;
     bool selected;
     bool is_boundary;
     
+    
     PathNode() : vertex(nullptr), pin(nullptr), arrival_time(0.0), 
-                 slack(0.0), depth(0), left_child(nullptr), 
+                 slack(0.0), depth(0), x(0.0), y(0.0),
+                 left_child(nullptr), 
                  right_child(nullptr), selected(false), is_boundary(false) {}
   };
   
-
   struct ConeSelectionConfig {
     float delay_threshold_ratio;
     int max_cone_depth;
     int max_cone_size;
     float min_improvement_threshold;
+    float distance_threshold_um;  // Physical distance threshold in um
     
     ConeSelectionConfig() 
-      : delay_threshold_ratio(0.2),
+      : delay_threshold_ratio(0.3),
         max_cone_depth(15),
         max_cone_size(500),
-        min_improvement_threshold(0.05) {}
+        min_improvement_threshold(0.05),
+        distance_threshold_um(50.0) {}  // Default 50 um threshold
   };
 
   // 智能 cone 选择方法
@@ -129,7 +134,12 @@ class Restructure
   PathNode* buildPathTree(sta::Vertex* vertex, 
                           int current_depth,
                           const ConeSelectionConfig& config);
+  bool shouldSelectChild(PathNode* parent,
+                         PathNode* left,
+                         PathNode* right,
+                         const ConeSelectionConfig& config);
   float calculateDelayGap(PathNode* left, PathNode* right);
+  float calculatePhysicalDistance(PathNode* node1, PathNode* node2);
   void selectNodesFromTree(PathNode* root, 
                            const ConeSelectionConfig& config,
                            std::set<sta::Vertex*>& selected_vertices,
@@ -138,6 +148,7 @@ class Restructure
   void cleanupPathTree(PathNode* node);
   float getVertexArrivalTime(sta::Vertex* vertex);
   float getVertexSlack(sta::Vertex* vertex);
+  std::pair<float, float> getInstanceCoordinate(odb::dbInst* inst);
 
   void deleteComponents();
   void getBlob(unsigned max_depth);
@@ -145,6 +156,7 @@ class Restructure
   void postABC(float worst_slack);
   bool writeAbcScript(const std::string& file_name);
   void writeOptCommands(std::ofstream& script);
+  void writeInstanceCoordinates(const std::string& file_name);
   void initDB();
   void getEndPoints(sta::PinSet& ends, bool area_mode, unsigned max_depth);
   int countConsts(odb::dbBlock* top_block);
@@ -180,6 +192,7 @@ class Restructure
 
   std::string input_blif_file_name_;
   std::string output_blif_file_name_;
+  std::string coord_file_name_;
   std::vector<std::string> lib_file_names_;
   std::set<odb::dbInst*> path_insts_;
 

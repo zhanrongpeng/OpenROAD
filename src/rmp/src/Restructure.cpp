@@ -29,6 +29,8 @@
 #include "db_sta/dbNetwork.hh"
 #include "db_sta/dbSta.hh"
 #include "odb/db.h"
+#include "odb/dbTransform.h"
+#include "odb/db.h"
 #include "rsz/Resizer.hh"
 #include "sta/Delay.hh"
 #include "sta/Graph.hh"
@@ -124,10 +126,6 @@ void Restructure::run(char* liberty_file_name,
   work_dir_name_ = workdir_name;
   work_dir_name_ = work_dir_name_ + "/";
 
-  logger_->report("Restructure mode: {}, is_area_mode: {}", 
-                  is_area_mode_ ? "AREA" : "TIMING",
-                  is_area_mode_);
-
   if (is_area_mode_) {  // Only in area mode
     removeConstCells();
   }
@@ -149,9 +147,8 @@ void Restructure::selectConeByPathDelay(const ConeSelectionConfig& config) {
   auto sta_state = open_sta_->search();
   sta::VertexSet* end_points = sta_state->endpoints();
   
-  debugPrint(logger_, RMP, "remap", 1,
-             "Starting smart cone selection from {} endpoints", 
-             end_points->size());
+  logger_->report("Starting smart cone selection from {} endpoints", 
+                  end_points->size());
   
   std::set<sta::Vertex*> all_selected_vertices;
   
@@ -168,16 +165,13 @@ void Restructure::selectConeByPathDelay(const ConeSelectionConfig& config) {
   }
   
   if (!worst_endpoint) {
-    debugPrint(logger_, RMP, "remap", 1, "No endpoint found for cone selection");
+    logger_->warn(RMP, 12, "No endpoint found for cone selection");
     return;
   }
   
-  debugPrint(logger_, RMP, "remap", 1,
-             "Selecting worst endpoint with slack: {}", worst_slack);
-  
-  const char* pin_name = open_sta_->network()->pathName(worst_endpoint->pin());
-  debugPrint(logger_, RMP, "remap", 1,
-             "Building path tree for endpoint: {}", pin_name);
+  logger_->report("Selecting worst endpoint with slack: {}", worst_slack);
+  logger_->report("Building path tree for endpoint: {}", 
+                  open_sta_->getDbNetwork()->pathName(worst_endpoint->pin()));
   
   // 构建路径树
   PathNode* root = buildPathTree(worst_endpoint, 0, config);
@@ -188,9 +182,8 @@ void Restructure::selectConeByPathDelay(const ConeSelectionConfig& config) {
     int current_size = 0;
     selectNodesFromTree(root, config, selected_vertices, current_size);
     
-    debugPrint(logger_, RMP, "remap", 1,
-               "Selected {} vertices from this endpoint", 
-               selected_vertices.size());
+    logger_->report("Selected {} vertices from this endpoint", 
+                    selected_vertices.size());
     
     // 合并到总的选择集合
     all_selected_vertices.insert(selected_vertices.begin(), 
@@ -203,9 +196,19 @@ void Restructure::selectConeByPathDelay(const ConeSelectionConfig& config) {
   // 收集选中的instances
   collectSelectedInstances(all_selected_vertices);
   
-  debugPrint(logger_, RMP, "remap", 1,
-             "Total selected {} instances for restructuring", 
-             path_insts_.size());
+  logger_->report("Total selected {} instances for restructuring", 
+                  path_insts_.size());
+}
+
+// 获取instance的物理坐标
+std::pair<float, float> Restructure::getInstanceCoordinate(odb::dbInst* inst) {
+  if (!inst) {
+    return {0.0f, 0.0f};
+  }
+  
+  const odb::dbTransform transform = inst->getTransform();
+  const odb::Point origin = transform.getOffset();
+  return {static_cast<float>(origin.getX()), static_cast<float>(origin.getY())};
 }
 
 Restructure::PathNode* Restructure::buildPathTree(
@@ -214,32 +217,45 @@ Restructure::PathNode* Restructure::buildPathTree(
     const ConeSelectionConfig& config) {
   
   if (!vertex) {
-    debugPrint(logger_, RMP, "remap", 2, "Null vertex at depth {}", current_depth);
+    debugPrint(logger_, RMP, "remap", 1, "Null vertex at depth {}", current_depth);
     return nullptr;
   }
   
   if (current_depth >= config.max_cone_depth) {
-    debugPrint(logger_, RMP, "remap", 2, "Reached max depth {}", current_depth);
-    return nullptr;
-  }
-  
-  sta::Pin* pin = vertex->pin();
-  if (!pin) {
-    debugPrint(logger_, RMP, "remap", 2, "Vertex has no pin at depth {}", current_depth);
+    debugPrint(logger_, RMP, "remap", 1, "Reached max depth {}", current_depth);
     return nullptr;
   }
   
   PathNode* node = new PathNode();
   node->vertex = vertex;
-  node->pin = pin;
+  node->pin = vertex->pin();
   node->arrival_time = getVertexArrivalTime(vertex);
   node->slack = getVertexSlack(vertex);
   node->depth = current_depth;
   
-  const char* pin_name = open_sta_->network()->pathName(pin);
+  // 获取当前节点的物理坐标
+  odb::dbITerm* term = nullptr;
+  odb::dbBTerm* port = nullptr;
+  odb::dbModITerm* moditerm = nullptr;
+  open_sta_->getDbNetwork()->staToDb(vertex->pin(), term, port, moditerm);
+  
+  if (term) {
+    odb::dbInst* inst = term->getInst();
+    if (inst) {
+      auto coords = getInstanceCoordinate(inst);
+      node->x = coords.first;
+      node->y = coords.second;
+    }
+  }
+  
   debugPrint(logger_, RMP, "remap", 1, 
-             "Building node at depth {}: {} (arrival: {}, slack: {})",
-             current_depth, pin_name, node->arrival_time, node->slack);
+             "Building node at depth {}: {} (arrival: {}, slack: {}, coord: {:.2f}, {:.2f})",
+             current_depth,
+             open_sta_->getDbNetwork()->pathName(vertex->pin()),
+             node->arrival_time,
+             node->slack,
+             node->x,
+             node->y);
   
   // 获取fanin edges
   sta::VertexInEdgeIterator edge_iter(vertex, open_sta_->graph());
@@ -251,20 +267,15 @@ Restructure::PathNode* Restructure::buildPathTree(
     sta::Edge* edge = edge_iter.next();
     sta::Vertex* from_vertex = edge->from(open_sta_->graph());
     
-    if (!from_vertex) continue;
-    
-    sta::Pin* from_pin = from_vertex->pin();
-    if (!from_pin) continue;
-    
-    // 跳过端口
-    if (open_sta_->network()->isTopLevelPort(from_pin)) {
+    // 跳过端口和sequential元素
+    if (open_sta_->getDbNetwork()->isTopLevelPort(from_vertex->pin())) {
       skipped_ports++;
       continue;
     }
     
-    sta::Instance* inst = open_sta_->network()->instance(from_pin);
-    sta::LibertyCell* lib_cell = inst ? open_sta_->network()->libertyCell(inst) : nullptr;
-    if (lib_cell && lib_cell->hasSequentials()) {
+    sta::LibertyCell* cell = open_sta_->getDbNetwork()->libertyCell(
+        open_sta_->getDbNetwork()->instance(from_vertex->pin()));
+    if (cell && cell->hasSequentials()) {
       skipped_seq++;
       continue;
     }
@@ -295,7 +306,7 @@ Restructure::PathNode* Restructure::buildPathTree(
       node->right_child = buildPathTree(fanins[1], current_depth + 1, config);
     }
   } else {
-    debugPrint(logger_, RMP, "remap", 1, "No valid fanins, this is a leaf node");
+    debugPrint(logger_, RMP, "remap", 1, "No valid fanins, stopping here");
   }
   
   return node;
@@ -318,6 +329,71 @@ float Restructure::calculateDelayGap(PathNode* left, PathNode* right) {
   return gap;
 }
 
+// 计算两个节点之间的物理距离（HPWL）
+float Restructure::calculatePhysicalDistance(PathNode* node1, PathNode* node2) {
+  if (!node1 || !node2) {
+    return std::numeric_limits<float>::max();
+  }
+  
+  // 使用曼哈顿距离作为HPWL的近似
+  float dx = std::abs(node1->x - node2->x);
+  float dy = std::abs(node1->y - node2->y);
+  float distance = dx + dy;
+  
+  return distance;
+}
+
+bool Restructure::shouldSelectChild(PathNode* parent,
+                                     PathNode* left,
+                                     PathNode* right,
+                                     const ConeSelectionConfig& config) {
+  if (!parent) {
+    return false;
+  }
+  
+  // 如果只有一个子节点,直接选择
+  if (!left || !right) {
+    return true;
+  }
+  
+  // 计算延迟差异比例
+  float delay_gap = calculateDelayGap(left, right);
+  
+  // 如果差异大于阈值,需要进一步判断
+  if (delay_gap > config.delay_threshold_ratio) {
+    // 选择arrival time较大的（较差的）子节点
+    PathNode* worse_child = (left->arrival_time > right->arrival_time) ? left : right;
+    
+    // 检查物理距离：如果太远就不选了
+    float distance = calculatePhysicalDistance(parent, worse_child);
+    debugPrint(logger_, RMP, "remap", 1,
+               "Delay gap {:.2%} > threshold {:.2%}, checking distance: {:.2f} um vs threshold {:.2f} um",
+               delay_gap, config.delay_threshold_ratio, 
+               distance, config.distance_threshold_um);
+    
+    if (distance > config.distance_threshold_um) {
+      debugPrint(logger_, RMP, "remap", 1,
+                 "Child too far ({:.2f} um > {:.2f} um), not selecting",
+                 distance, config.distance_threshold_um);
+      return false;
+    }
+    
+    // 距离在阈值内，选择较差的子节点
+    return false;  // 返回false表示只选一个（worse_child）
+  }
+  
+  // 差异小,检查物理距离后两个都选
+  // 如果两个子节点都离父节点太远，可能需要谨慎选择
+  float left_dist = calculatePhysicalDistance(parent, left);
+  float right_dist = calculatePhysicalDistance(parent, right);
+  
+  debugPrint(logger_, RMP, "remap", 1,
+             "Delay gap {:.2%} <= threshold {:.2%}, distances: left={:.2f} um, right={:.2f} um",
+             delay_gap, config.delay_threshold_ratio, left_dist, right_dist);
+  
+  return true;
+}
+
 void Restructure::selectNodesFromTree(
     PathNode* node,
     const ConeSelectionConfig& config,
@@ -325,122 +401,119 @@ void Restructure::selectNodesFromTree(
     int& current_size) {
   
   if (!node || current_size >= config.max_cone_size) {
+    debugPrint(logger_, RMP, "remap", 1,
+               "Stopping: node={}, size={}/{}", 
+               (void*)node, current_size, config.max_cone_size);
     return;
   }
   
-  // 1. 选择当前节点
+  // 选择当前节点
   node->selected = true;
   selected_vertices.insert(node->vertex);
   current_size++;
   
   debugPrint(logger_, RMP, "remap", 1,
-             "Selected vertex {} (slack: {:.3f}, arrival: {:.3f}, depth: {}, total: {})",
-             open_sta_->network()->pathName(node->pin),
-             node->slack, node->arrival_time, node->depth, current_size);
+             "Selected vertex {} (total: {})",
+             open_sta_->getDbNetwork()->pathName(node->pin),
+             current_size);
   
-  // 2. 如果没有子节点，停止
+  // 检查是否有子节点
   if (!node->left_child && !node->right_child) {
-    debugPrint(logger_, RMP, "remap", 1, "  -> Leaf node, stopping");
-    return;
+    debugPrint(logger_, RMP, "remap", 1, "Leaf node, stopping");
+    return;  // 叶子节点,停止
   }
   
-  // 3. 只有一个子节点 -> 直接递归
-  if (!node->left_child || !node->right_child) {
-    PathNode* child = node->left_child ? node->left_child : node->right_child;
-    debugPrint(logger_, RMP, "remap", 1, "  -> Single child, continuing");
-    selectNodesFromTree(child, config, selected_vertices, current_size);
-    return;
-  }
+  // 判断子节点的延迟改善潜力
+  float parent_slack = std::abs(node->slack);
   
-  // 4. 两个子节点 -> 根据 delay gap 决定选择策略
-  float delay_gap = calculateDelayGap(node->left_child, node->right_child);
+  // 注释掉 slack 阈值检查,让它继续选择
+  // if (parent_slack < config.min_improvement_threshold) {
+  //   debugPrint(logger_, RMP, "remap", 2,
+  //              "Stopping at node with slack {}, below threshold {}",
+  //              parent_slack, config.min_improvement_threshold);
+  //   return;
+  // }
+  
+  // 判断是否应该选择两个子节点
+  bool select_both = shouldSelectChild(node, node->left_child, 
+                                       node->right_child, config);
   
   debugPrint(logger_, RMP, "remap", 1,
-             "  -> Two children: L_arrival={:.3f}, R_arrival={:.3f}, gap={:.3f} (threshold={:.3f})",
-             node->left_child->arrival_time,
-             node->right_child->arrival_time,
-             delay_gap,
-             config.delay_threshold_ratio);
+             "Has children: left={}, right={}, select_both={}",
+             (void*)node->left_child, (void*)node->right_child, select_both);
   
-  if (delay_gap <= config.delay_threshold_ratio) {
-    // Gap 小 -> 两条路都关键 -> 都选
-    debugPrint(logger_, RMP, "remap", 1, "  -> Gap SMALL, selecting BOTH children");
-    selectNodesFromTree(node->left_child, config, selected_vertices, current_size);
-    selectNodesFromTree(node->right_child, config, selected_vertices, current_size);
+  if (select_both) {
+    // 两个子节点延迟差异不大,都选择
+    if (node->left_child) {
+      debugPrint(logger_, RMP, "remap", 2,
+                 "Selecting both children, delay gap is small");
+      selectNodesFromTree(node->left_child, config, 
+                         selected_vertices, current_size);
+    }
+    if (node->right_child) {
+      selectNodesFromTree(node->right_child, config, 
+                         selected_vertices, current_size);
+    }
   } else {
-    // Gap 大 -> 只选慢的那条
-    PathNode* critical = (node->left_child->arrival_time > node->right_child->arrival_time)
-                           ? node->left_child
-                           : node->right_child;
-    PathNode* non_critical = (critical == node->left_child) ? node->right_child : node->left_child;
+    // 差异大,只选择较差的那个继续递归
+    PathNode* worse_child = nullptr;
+    PathNode* better_child = nullptr;
     
-    debugPrint(logger_, RMP, "remap", 1,
-               "  -> Gap LARGE, selecting only CRITICAL child (arrival: {:.3f}), skipping non-critical (arrival: {:.3f})",
-               critical->arrival_time,
-               non_critical->arrival_time);
-    selectNodesFromTree(critical, config, selected_vertices, current_size);
+    if (node->left_child && node->right_child) {
+      if (node->left_child->arrival_time > node->right_child->arrival_time) {
+        worse_child = node->left_child;
+        better_child = node->right_child;
+      } else {
+        worse_child = node->right_child;
+        better_child = node->left_child;
+      }
+      
+      debugPrint(logger_, RMP, "remap", 2,
+                 "Large delay gap detected, selecting worse path only. "
+                 "Gap: {:.2%}", 
+                 calculateDelayGap(node->left_child, node->right_child));
+      
+      // 较差的子节点:继续递归
+      selectNodesFromTree(worse_child, config, selected_vertices, current_size);
+      
+      // 较好的子节点:标记为边界,选中但不递归
+      better_child->selected = true;
+      better_child->is_boundary = true;
+      selected_vertices.insert(better_child->vertex);
+      current_size++;
+      
+      debugPrint(logger_, RMP, "remap", 2,
+                 "Better child marked as boundary, not recursing");
+    } else if (node->left_child) {
+      // 只有左子节点
+      selectNodesFromTree(node->left_child, config, selected_vertices, current_size);
+    } else if (node->right_child) {
+      // 只有右子节点
+      selectNodesFromTree(node->right_child, config, selected_vertices, current_size);
+    }
   }
 }
 
 void Restructure::collectSelectedInstances(
     const std::set<sta::Vertex*>& vertices) {
   
-  debugPrint(logger_, RMP, "remap", 1,
-             "Converting {} vertices to instances", vertices.size());
-  
-  int converted = 0;
-  int skipped_ports = 0;
-  int skipped_blocks = 0;
-  int skipped_no_iterm = 0;
+  path_insts_.clear();
   
   for (sta::Vertex* vertex : vertices) {
     sta::Pin* pin = vertex->pin();
-    if (!pin) continue;
-    
-    const char* pin_name = open_sta_->network()->pathName(pin);
-    
-    // 跳过 top-level ports
-    if (open_sta_->network()->isTopLevelPort(pin)) {
-      skipped_ports++;
-      debugPrint(logger_, RMP, "remap", 2, "Skipping top-level port: {}", pin_name);
-      continue;
-    }
     
     odb::dbITerm* term = nullptr;
     odb::dbBTerm* port = nullptr;
     odb::dbModITerm* moditerm = nullptr;
     open_sta_->getDbNetwork()->staToDb(pin, term, port, moditerm);
     
-    if (!term) {
-      skipped_no_iterm++;
-      debugPrint(logger_, RMP, "remap", 2, "Cannot find iterm for pin: {}", pin_name);
-      continue;
-    }
-    
-    odb::dbInst* inst = term->getInst();
-    if (!inst) {
-      debugPrint(logger_, RMP, "remap", 2, "No instance for pin: {}", pin_name);
-      continue;
-    }
-    
-    // 跳过 block instances
-    if (inst->getMaster()->isBlock()) {
-      skipped_blocks++;
-      debugPrint(logger_, RMP, "remap", 2, "Skipping block instance: {}", 
-                 inst->getName().c_str());
-      continue;
-    }
-    
-    if (path_insts_.insert(inst).second) {
-      converted++;
-      debugPrint(logger_, RMP, "remap", 1, "Added instance: {}", inst->getName().c_str());
+    if (term) {
+      odb::dbInst* inst = term->getInst();
+      if (inst && !inst->getMaster()->isBlock()) {
+        path_insts_.insert(inst);
+      }
     }
   }
-  
-  debugPrint(logger_, RMP, "remap", 1,
-             "Conversion complete: {} instances added, {} ports skipped, "
-             "{} blocks skipped, {} no-iterm skipped",
-             converted, skipped_ports, skipped_blocks, skipped_no_iterm);
 }
 
 void Restructure::cleanupPathTree(PathNode* node) {
@@ -469,24 +542,15 @@ void Restructure::getBlob(unsigned max_depth)
   open_sta_->ensureLevelized();
   open_sta_->searchPreamble();
 
-  if (!is_area_mode_) {
-    // Timing mode: 使用 path-dominant cone selection
-    ConeSelectionConfig config;
-    config.max_cone_depth = max_depth;
-    config.delay_threshold_ratio = 0.2;  // 可调参数
-    config.max_cone_size = 500;
-    
-    selectConeByPathDelay(config);
-    
-  } else {
-    // Area mode: 使用原来的方法
-    sta::PinSet ends(open_sta_->getDbNetwork());
-    getEndPoints(ends, is_area_mode_, max_depth);
-    
-    if (!ends.empty()) {
+  sta::PinSet ends(open_sta_->getDbNetwork());
+
+  getEndPoints(ends, is_area_mode_, max_depth);
+  
+  if (!ends.empty()) {
+    if (is_area_mode_) {
       sta::PinSet boundary_points = resizer_->findFaninFanouts(ends);
-      
-      logger_->report("Found {} pins in extracted logic.", boundary_points.size());
+      logger_->report("Found {} pins in extracted logic.",
+                      boundary_points.size());
       
       for (const sta::Pin* pin : boundary_points) {
         odb::dbITerm* term = nullptr;
@@ -498,9 +562,19 @@ void Restructure::getBlob(unsigned max_depth)
           path_insts_.insert(term->getInst());
         }
       }
-      
-      logger_->report("Found {} instances for restructuring.", path_insts_.size());
+    } else {
+      ConeSelectionConfig config;
+      config.max_cone_depth = max_depth;
+      config.delay_threshold_ratio = 0.3;     
+      config.max_cone_size = 500;              
+      config.min_improvement_threshold = 0.05;
+      config.distance_threshold_um = 50.0;  // 50 um threshold for physical distance
+
+      selectConeByPathDelay(config);
     }
+
+    logger_->report("Found {} instances for restructuring.",
+                    path_insts_.size());
   }
 }
 
@@ -509,6 +583,7 @@ void Restructure::runABC()
   const std::string prefix
       = work_dir_name_ + std::string(block_->getConstName());
   input_blif_file_name_ = prefix + "_crit_path.blif";
+  coord_file_name_ = prefix + "_coords.txt";
   std::vector<std::string> files_to_remove;
 
   debugPrint(logger_,
@@ -525,7 +600,11 @@ void Restructure::runABC()
   debugPrint(
       logger_, RMP, "remap", 1, "Writing blif file {}", input_blif_file_name_);
   files_to_remove.emplace_back(input_blif_file_name_);
- 
+
+  // Write instance coordinates for ABC
+  writeInstanceCoordinates(coord_file_name_);
+  files_to_remove.emplace_back(coord_file_name_);
+
   // abc optimization
   std::vector<Mode> modes;
   std::vector<pid_t> child_proc;
@@ -642,7 +721,7 @@ void Restructure::runABC()
                countConsts(block_));
   } else {
     logger_->info(
-        RMP, 4, "All re-synthesis runs discarded, keeping original netlist.");
+        RMP, 13, "All re-synthesis runs discarded, keeping original netlist.");
   }
 
   for (const auto& file_to_remove : files_to_remove) {
@@ -865,7 +944,13 @@ bool Restructure::writeAbcScript(const std::string& file_name)
            << '\n';
   }
 
-  writeOptCommands(script);
+  // Physical-aware mapping: skip rewrite/refactor, use strash + read_coords + if
+  script << "strash\n";
+  script << "read_coords " << coord_file_name_ << '\n';
+
+  // Use if command with wire-aware mapping (-W flag)
+  // WireDelayFactor 0.001 = 1nm per unit wirelength (scaled)
+  script << "if -W 0.001\n";
 
   script << "write_blif " << output_blif_file_name_ << '\n';
 
@@ -979,6 +1064,33 @@ void Restructure::setTieLoPort(sta::LibertyPort* tieLoPort)
     locell_ = tieLoPort->libertyCell()->name();
     loport_ = tieLoPort->name();
   }
+}
+
+void Restructure::writeInstanceCoordinates(const std::string& file_name)
+{
+  std::ofstream coord_file(file_name.c_str());
+  if (!coord_file.is_open()) {
+    logger_->error(RMP, 4, "Cannot open coordinate file {} for writing.", file_name);
+    return;
+  }
+
+  // Write header comment
+  coord_file << "# Instance coordinates for ABC-aware remapping\n";
+  coord_file << "# Format: instance_name x y\n";
+
+  // Write number of instances
+  coord_file << path_insts_.size() << "\n";
+
+  // Write each instance coordinate
+  for (auto inst : path_insts_) {
+    const odb::Point origin = inst->getOrigin();
+    coord_file << inst->getName() << " " << origin.x() << " " << origin.y() << "\n";
+  }
+
+  coord_file.close();
+  debugPrint(logger_, RMP, "remap", 1,
+             "Wrote {} instance coordinates to {}",
+             path_insts_.size(), file_name);
 }
 
 bool Restructure::readAbcLog(const std::string& abc_file_name,
