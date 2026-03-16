@@ -746,14 +746,14 @@ void Restructure::getEndPoints(sta::PinSet& ends,
   auto sta_state = open_sta_->search();
   sta::VertexSet* end_points = sta_state->endpoints();
   std::size_t path_found = end_points->size();
-  logger_->report("Number of paths for restructure are {}", path_found);
+  debugPrint(logger_, RMP, "remap", 1, "Number of paths for restructure are {}", path_found);
   for (auto& end_point : *end_points) {
     if (!is_area_mode_) {
       sta::Path* path
           = open_sta_->vertexWorstSlackPath(end_point, sta::MinMax::max());
       sta::PathExpanded expanded(path, open_sta_);
       // Members in expanded include gate output and net so divide by 2
-      logger_->report("Found path of depth {}", expanded.size() / 2);
+      debugPrint(logger_, RMP, "remap", 1, "Found path of depth {}", expanded.size() / 2);
       if (expanded.size() / 2 > max_depth) {
         ends.insert(end_point->pin());
         // Use only one end point to limit blob size for timing
