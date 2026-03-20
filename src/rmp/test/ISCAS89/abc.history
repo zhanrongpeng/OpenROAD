@@ -1,0 +1,28 @@
+source ./results/s359320ord_abc_script.tcl
+source ./results/s359321ord_abc_script.tcl
+source ./results/s359322ord_abc_script.tcl
+source ./results/s359323ord_abc_script.tcl
+source ./results/s359320ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log0
+source ./results/s359321ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log1
+source ./results/s359322ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log2
+source ./results/s359323ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log3
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359320ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log0
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359321ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log1
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359322ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log2
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359323ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log3
+source /root/OpenROAD/src/rmp/test/ISCAS89/./results/s359320ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log0
+source /root/OpenROAD/src/rmp/test/ISCAS89/./results/s359321ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log1
+source /root/OpenROAD/src/rmp/test/ISCAS89/./results/s359322ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log2
+source /root/OpenROAD/src/rmp/test/ISCAS89/./results/s359323ord_abc_script.tcl 2>&1 | tee results/abc_rcon.log3
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359320ord_abc_script.tcl 2>&1 | tee /root/OpenROAD/src/rmp/test/ISCAS89/results/abc_rcon.log0
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359321ord_abc_script.tcl 2>&1 | tee /root/OpenROAD/src/rmp/test/ISCAS89/results/abc_rcon.log1
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359322ord_abc_script.tcl 2>&1 | tee /root/OpenROAD/src/rmp/test/ISCAS89/results/abc_rcon.log2
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359323ord_abc_script.tcl 2>&1 | tee /root/OpenROAD/src/rmp/test/ISCAS89/results/abc_rcon.log3
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359320ord_abc_script.tcl
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359321ord_abc_script.tcl
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359322ord_abc_script.tcl
+source /root/OpenROAD/src/rmp/test/ISCAS89/results/s359323ord_abc_script.tcl
+source ./results/s359320ord_abc_script.tcl
+source ./results/s359321ord_abc_script.tcl
+source ./results/s359322ord_abc_script.tcl
+source ./results/s359323ord_abc_script.tcl
