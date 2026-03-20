@@ -80,6 +80,10 @@ class AbcLibraryFactory
   void AbcPopulateAbcSurfaceFromSta(abc::SC_Surface* abc_table,
                                     const sta::TableModel* model,
                                     sta::Units* units);
+  // Fill 1x1 timing table for tdelay mode (fixed delay instead of lookup table)
+  void AbcPopulateAbcTdelayFromSta(abc::SC_Surface* abc_table,
+                                   const sta::TableModel* model,
+                                   sta::Units* units);
   std::vector<sta::LibertyCell*> GetLibertyCellsFromCorner(sta::Corner* corner);
   std::vector<abc::SC_Pin*> CreateAbcInputPins(sta::LibertyCell* cell);
 

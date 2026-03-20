@@ -187,6 +187,36 @@ void AbcLibraryFactory::AbcPopulateAbcSurfaceFromSta(
   }
 }
 
+void AbcLibraryFactory::AbcPopulateAbcTdelayFromSta(
+    abc::SC_Surface* abc_table,
+    const sta::TableModel* model,
+    sta::Units* units)
+{
+  sta::Unit* time_unit = units->timeUnit();
+
+  // For tdelay mode, we use a 1x1 table with a fixed delay value
+  // This allows ABC to use constant delay instead of lookup table interpolation
+  // Use the delay at minimum slew and minimum load (index 0,0)
+  float delay_value = time_unit->staToUser(model->value(0, 0, 0));
+
+  // Add one entry for axis 0 (slew) - use 0 as placeholder
+  abc::Vec_FltPush(&abc_table->vIndex0, 0.0);
+  abc::Vec_IntPush(&abc_table->vIndex0I, 0);
+
+  // Add one entry for axis 1 (load) - use 0 as placeholder
+  abc::Vec_FltPush(&abc_table->vIndex1, 0.0);
+  abc::Vec_IntPush(&abc_table->vIndex1I, 0);
+
+  // Add single data point for the delay
+  abc::Vec_Flt_t* axis_0_abc_vec = abc::Vec_FltAlloc(1);
+  abc::Vec_Int_t* axis_0_abc_int_vec = abc::Vec_IntAlloc(1);
+  abc::Vec_PtrPush(&abc_table->vData, axis_0_abc_vec);
+  abc::Vec_PtrPush(&abc_table->vDataI, axis_0_abc_int_vec);
+
+  abc::Vec_FltPush(axis_0_abc_vec, delay_value);
+  abc::Vec_IntPush(axis_0_abc_int_vec, abc::Scl_Flt2Int(delay_value));
+}
+
 std::vector<abc::SC_Pin*> AbcLibraryFactory::CreateAbcInputPins(
     sta::LibertyCell* cell)
 {
@@ -333,10 +363,12 @@ std::vector<abc::SC_Pin*> AbcLibraryFactory::CreateAbcOutputPins(
                        cell->name());
       }
       sta::Units* units = cell->libertyLibrary()->units();
-      AbcPopulateAbcSurfaceFromSta(
+      // Use tdelay (fixed delay) instead of lookup table interpolation for cell delay
+      AbcPopulateAbcTdelayFromSta(
           &time_table->pCellRise, rise_gate_model->delayModel(), units);
-      AbcPopulateAbcSurfaceFromSta(
+      AbcPopulateAbcTdelayFromSta(
           &time_table->pCellFall, fall_gate_model->delayModel(), units);
+      // Keep slew as lookup table (or also use tdelay if desired)
       AbcPopulateAbcSurfaceFromSta(
           &time_table->pRiseTrans, rise_gate_model->slewModel(), units);
       AbcPopulateAbcSurfaceFromSta(

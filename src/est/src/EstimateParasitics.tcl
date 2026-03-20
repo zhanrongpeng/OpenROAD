@@ -98,6 +98,8 @@ proc set_layer_rc { args } {
     foreach corner $corners {
       est::set_layer_rc_cmd $layer $corner $res $cap
     }
+    # Also add this layer to signal_layers_ so estimate_parasitics sees non-empty RC
+    est::add_signal_layer_cmd $layer
   } elseif { [info exists keys(-via)] } {
     set layer_name $keys(-via)
     set layer [$tech findLayer $layer_name]

@@ -1,13 +1,11 @@
-source helpers.tcl
+source /root/OpenROAD/test/helpers.tcl
 read_liberty Nangate45/Nangate45_typ.lib
 read_lef Nangate45/Nangate45.lef
-read_def gcd_placed.def
-read_sdc gcd.sdc
-# set_layer_rc needs LEF layer info, so must come after read_lef
+read_def s35932.def
+read_sdc s35932.sdc
 source Nangate45/Nangate45.rc
-# Note: set_wire_rc -layer is NOT needed here; using it after set_layer_rc would
-# override the correct values because Nangate45.lef has no RESISTANCE on metal3.
-estimate_parasitics -placement
+set_wire_rc -layer metal3
+estimate_parasitics -placement 
 
 report_worst_slack
 

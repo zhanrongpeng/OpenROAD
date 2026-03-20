@@ -89,9 +89,20 @@ class Restructure
   }
   void setAnnealingInitialOps(unsigned ops) { annealing_init_ops_ = ops; }
   void setSlackThreshold(sta::Slack thresh) { slack_threshold_ = thresh; }
+  void setWireRC(double r_per_um, double c_per_um)
+  {
+    wire_r_per_um_ = r_per_um;
+    wire_c_per_um_ = c_per_um;
+  }
   void setMode(const char* mode_name);
   void setTieLoPort(sta::LibertyPort* loport);
   void setTieHiPort(sta::LibertyPort* hiport);
+
+  // Smart cone selection configuration
+  void setConeConfigDelayThreshold(float ratio);
+  void setConeConfigMaxDepth(int depth);
+  void setConeConfigMaxSize(int size);
+  void setConeConfigDistanceThreshold(float distance_um);
 
  private:
   struct PathNode {
@@ -119,19 +130,23 @@ class Restructure
     int max_cone_depth;
     int max_cone_size;
     float min_improvement_threshold;
-    float distance_threshold_um;  // Physical distance threshold in um
-    
-    ConeSelectionConfig() 
-      : delay_threshold_ratio(0.3),
+    float distance_threshold_um;
+
+    ConeSelectionConfig()
+      : delay_threshold_ratio(0.3f),
         max_cone_depth(15),
         max_cone_size(500),
-        min_improvement_threshold(0.05),
-        distance_threshold_um(50.0) {}  // Default 50 um threshold
+        min_improvement_threshold(0.05f),
+        distance_threshold_um(50.0f) {}
   };
 
-  // 智能 cone 选择方法
-  void selectConeByPathDelay(const ConeSelectionConfig& config);
-  PathNode* buildPathTree(sta::Vertex* vertex, 
+  // Member variables
+  ConeSelectionConfig cone_config_;
+  unsigned max_depth_;
+
+  // Smart cone selection methods
+  // void selectConeByPathDelay(const ConeSelectionConfig& config);
+  PathNode* buildPathTree(const sta::Pin* pin,
                           int current_depth,
                           const ConeSelectionConfig& config);
   bool shouldSelectChild(PathNode* parent,
@@ -148,7 +163,7 @@ class Restructure
   void cleanupPathTree(PathNode* node);
   float getVertexArrivalTime(sta::Vertex* vertex);
   float getVertexSlack(sta::Vertex* vertex);
-  std::pair<float, float> getInstanceCoordinate(odb::dbInst* inst);
+  std::pair<float, float> getInstanceCoordinateFromPin(const sta::Pin* pin);
 
   void deleteComponents();
   void getBlob(unsigned max_depth);
@@ -195,6 +210,10 @@ class Restructure
   std::string coord_file_name_;
   std::vector<std::string> lib_file_names_;
   std::set<odb::dbInst*> path_insts_;
+
+  // Wire RC passed directly from OpenROAD to ABC (ohm/um and fF/um)
+  double wire_r_per_um_ = 0.0;
+  double wire_c_per_um_ = 0.0;
 
   Mode opt_mode_{Mode::DELAY_1};
   bool is_area_mode_{false};

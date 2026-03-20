@@ -19,6 +19,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#include <cmath>
+#include <queue>
 
 #include "annealing_strategy.h"
 #include "base/abc/abc.h"
@@ -30,11 +32,12 @@
 #include "db_sta/dbSta.hh"
 #include "odb/db.h"
 #include "odb/dbTransform.h"
-#include "odb/db.h"
 #include "rsz/Resizer.hh"
 #include "sta/Delay.hh"
 #include "sta/Graph.hh"
+#include "sta/GraphClass.hh"
 #include "sta/Liberty.hh"
+#include "sta/Corner.hh"
 #include "sta/Network.hh"
 #include "sta/NetworkClass.hh"
 #include "sta/Path.hh"
@@ -54,6 +57,7 @@ using abc::Abc_Frame_t;
 using abc::Abc_FrameGetGlobalFrame;
 using abc::Abc_Start;
 using abc::Abc_Stop;
+using abc::Abc_FrameSetWireRC;
 using cut::Blif;
 using utl::RMP;
 
@@ -68,6 +72,13 @@ Restructure::Restructure(utl::Logger* logger,
   open_sta_ = open_sta;
   resizer_ = resizer;
   estimate_parasitics_ = estimate_parasitics;
+
+  cone_config_.delay_threshold_ratio = 0.3f;
+  cone_config_.max_cone_depth = 15;
+  cone_config_.max_cone_size = 500;
+  cone_config_.min_improvement_threshold = 0.05f;
+  cone_config_.distance_threshold_um = 50.0f;
+  max_depth_ = 16;
 
   cut::abcInit();
 }
@@ -121,6 +132,7 @@ void Restructure::run(char* liberty_file_name,
 
   logfile_ = abc_logfile;
   sta::Slack worst_slack = slack_threshold;
+  max_depth_ = max_depth;
 
   lib_file_names_.emplace_back(liberty_file_name);
   work_dir_name_ = workdir_name;
@@ -130,7 +142,7 @@ void Restructure::run(char* liberty_file_name,
     removeConstCells();
   }
 
-  getBlob(max_depth);
+  getBlob(max_depth_);
 
   if (!path_insts_.empty()) {
     runABC();
@@ -139,174 +151,103 @@ void Restructure::run(char* liberty_file_name,
   }
 }
 
-void Restructure::selectConeByPathDelay(const ConeSelectionConfig& config) {
-  open_sta_->ensureGraph();
-  open_sta_->ensureLevelized();
-  open_sta_->searchPreamble();
-  
-  auto sta_state = open_sta_->search();
-  sta::VertexSet* end_points = sta_state->endpoints();
-  
-  logger_->report("Starting smart cone selection from {} endpoints", 
-                  end_points->size());
-  
-  std::set<sta::Vertex*> all_selected_vertices;
-  
-  // 找到 worst slack 的 endpoint
-  sta::Vertex* worst_endpoint = nullptr;
-  sta::Slack worst_slack = std::numeric_limits<float>::max();
-  
-  for (auto& end_point : *end_points) {
-    sta::Slack slack = open_sta_->vertexSlack(end_point, sta::MinMax::max());
-    if (slack < worst_slack) {
-      worst_slack = slack;
-      worst_endpoint = end_point;
-    }
-  }
-  
-  if (!worst_endpoint) {
-    logger_->warn(RMP, 12, "No endpoint found for cone selection");
-    return;
-  }
-  
-  logger_->report("Selecting worst endpoint with slack: {}", worst_slack);
-  logger_->report("Building path tree for endpoint: {}", 
-                  open_sta_->getDbNetwork()->pathName(worst_endpoint->pin()));
-  
-  // 构建路径树
-  PathNode* root = buildPathTree(worst_endpoint, 0, config);
-  
-  if (root) {
-    // 从树中选择节点
-    std::set<sta::Vertex*> selected_vertices;
-    int current_size = 0;
-    selectNodesFromTree(root, config, selected_vertices, current_size);
-    
-    logger_->report("Selected {} vertices from this endpoint", 
-                    selected_vertices.size());
-    
-    // 合并到总的选择集合
-    all_selected_vertices.insert(selected_vertices.begin(), 
-                                 selected_vertices.end());
-    
-    // 清理树
-    cleanupPathTree(root);
-  }
-  
-  // 收集选中的instances
-  collectSelectedInstances(all_selected_vertices);
-  
-  logger_->report("Total selected {} instances for restructuring", 
-                  path_insts_.size());
-}
-
-// 获取instance的物理坐标
-std::pair<float, float> Restructure::getInstanceCoordinate(odb::dbInst* inst) {
-  if (!inst) {
+std::pair<float, float> Restructure::getInstanceCoordinateFromPin(const sta::Pin* pin) {
+  if (!pin) {
     return {0.0f, 0.0f};
   }
   
-  const odb::dbTransform transform = inst->getTransform();
-  const odb::Point origin = transform.getOffset();
-  return {static_cast<float>(origin.getX()), static_cast<float>(origin.getY())};
+  odb::dbITerm* term = nullptr;
+  odb::dbBTerm* port = nullptr;
+  odb::dbModITerm* moditerm = nullptr;
+  open_sta_->getDbNetwork()->staToDb(pin, term, port, moditerm);
+  
+  if (term) {
+    odb::dbInst* inst = term->getInst();
+    odb::dbBox* bbox = inst->getBBox();
+    if (bbox) {
+      float x = (bbox->xMin() + bbox->xMax()) / 2.0;
+      float y = (bbox->yMin() + bbox->yMax()) / 2.0;
+      return {x, y};
+    }
+  } else if (port) {
+    odb::Rect rect = port->getBBox();
+    float x = (rect.xMin() + rect.xMax()) / 2.0;
+    float y = (rect.yMin() + rect.yMax()) / 2.0;
+    return {x, y};
+  }
+  
+  return {0.0f, 0.0f};
 }
 
 Restructure::PathNode* Restructure::buildPathTree(
-    sta::Vertex* vertex,
+    const sta::Pin* pin,
     int current_depth,
     const ConeSelectionConfig& config) {
   
-  if (!vertex) {
-    debugPrint(logger_, RMP, "remap", 1, "Null vertex at depth {}", current_depth);
+  if (!pin || current_depth >= config.max_cone_depth) {
     return nullptr;
   }
   
-  if (current_depth >= config.max_cone_depth) {
-    debugPrint(logger_, RMP, "remap", 1, "Reached max depth {}", current_depth);
+  sta::Graph* graph = open_sta_->graph();
+  sta::Vertex* vertex = graph->pinLoadVertex(pin);
+  
+  if (!vertex) {
     return nullptr;
   }
   
   PathNode* node = new PathNode();
   node->vertex = vertex;
-  node->pin = vertex->pin();
+  node->pin = const_cast<sta::Pin*>(pin);
   node->arrival_time = getVertexArrivalTime(vertex);
   node->slack = getVertexSlack(vertex);
   node->depth = current_depth;
   
-  // 获取当前节点的物理坐标
-  odb::dbITerm* term = nullptr;
-  odb::dbBTerm* port = nullptr;
-  odb::dbModITerm* moditerm = nullptr;
-  open_sta_->getDbNetwork()->staToDb(vertex->pin(), term, port, moditerm);
+  auto coords = getInstanceCoordinateFromPin(pin);
+  node->x = coords.first;
+  node->y = coords.second;
   
-  if (term) {
-    odb::dbInst* inst = term->getInst();
-    if (inst) {
-      auto coords = getInstanceCoordinate(inst);
-      node->x = coords.first;
-      node->y = coords.second;
+  node->left_child = nullptr;
+  node->right_child = nullptr;
+  node->selected = false;
+  node->is_boundary = false;
+  
+  // 使用 resizer 的 findFanins 来获取 fanin pins
+  sta::PinSet fanin_pins_set(open_sta_->getDbNetwork());
+  fanin_pins_set.insert(pin);
+  sta::PinSet fanins = resizer_->findFanins(fanin_pins_set);
+  
+  // 去掉输入pin本身
+  for (auto fanin : fanins) {
+    if (fanin != pin) {
+      fanins.erase(fanin);
     }
   }
   
-  debugPrint(logger_, RMP, "remap", 1, 
-             "Building node at depth {}: {} (arrival: {}, slack: {}, coord: {:.2f}, {:.2f})",
-             current_depth,
-             open_sta_->getDbNetwork()->pathName(vertex->pin()),
-             node->arrival_time,
-             node->slack,
-             node->x,
-             node->y);
-  
-  // 获取fanin edges
-  sta::VertexInEdgeIterator edge_iter(vertex, open_sta_->graph());
-  std::vector<sta::Vertex*> fanins;
-  int skipped_ports = 0;
-  int skipped_seq = 0;
-  
-  while (edge_iter.hasNext()) {
-    sta::Edge* edge = edge_iter.next();
-    sta::Vertex* from_vertex = edge->from(open_sta_->graph());
-    
-    // 跳过端口和sequential元素
-    if (open_sta_->getDbNetwork()->isTopLevelPort(from_vertex->pin())) {
-      skipped_ports++;
-      continue;
+  // 重新获取真正的fanins
+  sta::PinSet real_fanins(open_sta_->getDbNetwork());
+  for (auto fanin : fanins) {
+    if (fanin != pin) {
+      real_fanins.insert(fanin);
     }
-    
-    sta::LibertyCell* cell = open_sta_->getDbNetwork()->libertyCell(
-        open_sta_->getDbNetwork()->instance(from_vertex->pin()));
-    if (cell && cell->hasSequentials()) {
-      skipped_seq++;
-      continue;
-    }
-    
-    fanins.push_back(from_vertex);
   }
   
-  debugPrint(logger_, RMP, "remap", 1,
-             "Found {} fanins (skipped {} ports, {} sequential)",
-             fanins.size(), skipped_ports, skipped_seq);
+  // 转为 vector 以便索引
+  std::vector<const sta::Pin*> fanin_vec;
+  for (auto fanin : real_fanins) {
+    fanin_vec.push_back(fanin);
+  }
   
-  // 递归构建子节点(最多取2个最差的fanin)
-  if (!fanins.empty()) {
-    // 按arrival time排序,取延迟最大的
-    std::sort(fanins.begin(), fanins.end(), 
-              [this](sta::Vertex* a, sta::Vertex* b) {
-                return getVertexArrivalTime(a) > getVertexArrivalTime(b);
-              });
-    
-    debugPrint(logger_, RMP, "remap", 1,
-               "Recursing into {} fanin(s)", std::min(2, (int)fanins.size()));
-    
-    // 构建左子节点(最差的fanin)
-    node->left_child = buildPathTree(fanins[0], current_depth + 1, config);
-    
-    // 如果有第二个fanin,构建右子节点
-    if (fanins.size() > 1) {
-      node->right_child = buildPathTree(fanins[1], current_depth + 1, config);
-    }
-  } else {
-    debugPrint(logger_, RMP, "remap", 1, "No valid fanins, stopping here");
+  if (fanin_vec.empty()) {
+    node->is_boundary = true;
+    return node;
+  }
+  
+  // 最多取2个fanin
+  if (fanin_vec.size() >= 1) {
+    node->left_child = buildPathTree(fanin_vec[0], current_depth + 1, config);
+  }
+  if (fanin_vec.size() >= 2) {
+    node->right_child = buildPathTree(fanin_vec[1], current_depth + 1, config);
   }
   
   return node;
@@ -344,9 +285,9 @@ float Restructure::calculatePhysicalDistance(PathNode* node1, PathNode* node2) {
 }
 
 bool Restructure::shouldSelectChild(PathNode* parent,
-                                     PathNode* left,
-                                     PathNode* right,
-                                     const ConeSelectionConfig& config) {
+                                   PathNode* left,
+                                   PathNode* right,
+                                   const ConeSelectionConfig& config) {
   if (!parent) {
     return false;
   }
@@ -356,42 +297,65 @@ bool Restructure::shouldSelectChild(PathNode* parent,
     return true;
   }
   
-  // 计算延迟差异比例
+  // 计算延迟差异
   float delay_gap = calculateDelayGap(left, right);
+  float parent_at = parent->arrival_time;
   
-  // 如果差异大于阈值,需要进一步判断
-  if (delay_gap > config.delay_threshold_ratio) {
-    // 选择arrival time较大的（较差的）子节点
-    PathNode* worse_child = (left->arrival_time > right->arrival_time) ? left : right;
-    
-    // 检查物理距离：如果太远就不选了
-    float distance = calculatePhysicalDistance(parent, worse_child);
-    debugPrint(logger_, RMP, "remap", 1,
-               "Delay gap {:.2%} > threshold {:.2%}, checking distance: {:.2f} um vs threshold {:.2f} um",
-               delay_gap, config.delay_threshold_ratio, 
-               distance, config.distance_threshold_um);
-    
-    if (distance > config.distance_threshold_um) {
-      debugPrint(logger_, RMP, "remap", 1,
-                 "Child too far ({:.2f} um > {:.2f} um), not selecting",
-                 distance, config.distance_threshold_um);
-      return false;
-    }
-    
-    // 距离在阈值内，选择较差的子节点
-    return false;  // 返回false表示只选一个（worse_child）
+  // 避免除以0
+  if (parent_at <= 0.0f) {
+    parent_at = 1.0f;
   }
   
-  // 差异小,检查物理距离后两个都选
-  // 如果两个子节点都离父节点太远，可能需要谨慎选择
+  float delay_gap_ratio = delay_gap / parent_at;
+  
+  // 计算物理距离
   float left_dist = calculatePhysicalDistance(parent, left);
   float right_dist = calculatePhysicalDistance(parent, right);
   
   debugPrint(logger_, RMP, "remap", 1,
-             "Delay gap {:.2%} <= threshold {:.2%}, distances: left={:.2f} um, right={:.2f} um",
-             delay_gap, config.delay_threshold_ratio, left_dist, right_dist);
+             "Checking children: delay_gap={:.4f}, ratio={:.2%}, "
+             "left_dist={:.2f}um, right_dist={:.2f}um, threshold={:.2f}um",
+             delay_gap, delay_gap_ratio, left_dist, right_dist, 
+             config.distance_threshold_um);
   
-  return true;
+  // 如果两个子节点都在物理距离阈值内
+  if (left_dist <= config.distance_threshold_um && 
+      right_dist <= config.distance_threshold_um) {
+    if (delay_gap_ratio <= config.delay_threshold_ratio) {
+      // 差异小，两个都选
+      debugPrint(logger_, RMP, "remap", 1,
+                 "Both within distance, small delay gap - select both");
+      return true;
+    } else {
+      // 差异大，两个都选（因为物理距离都在阈值内）
+      debugPrint(logger_, RMP, "remap", 1,
+                 "Both within distance, large delay gap - still select both");
+      return true;
+    }
+  }
+  
+  // 至少有一个子节点超出物理距离阈值
+  bool left_ok = left_dist <= config.distance_threshold_um;
+  bool right_ok = right_dist <= config.distance_threshold_um;
+  
+  if (left_ok && !right_ok) {
+    // 只有左边在阈值内
+    debugPrint(logger_, RMP, "remap", 1, "Only left child within distance");
+    return true;  // 选中left
+  } else if (!left_ok && right_ok) {
+    // 只有右边在阈值内
+    debugPrint(logger_, RMP, "remap", 1, "Only right child within distance");
+    return true;  // 选中right
+  } else {
+    // 都不在阈值内，需要选择一个更近的
+    debugPrint(logger_, RMP, "remap", 1, 
+               "Neither child within distance, selecting closer one");
+    if (left_dist < right_dist) {
+      return true;  // 选中left
+    } else {
+      return true;  // 选中right（如果相等）
+    }
+  }
 }
 
 void Restructure::selectNodesFromTree(
@@ -542,35 +506,52 @@ void Restructure::getBlob(unsigned max_depth)
   open_sta_->ensureLevelized();
   open_sta_->searchPreamble();
 
+  // Compute wire RC from estimate_parasitics_
+  // wireSignalResistance() returns kohm/m (from set_layer_rc in kohm/um / 1um)
+  // wireSignalCapacitance() returns pf/m (from set_layer_rc in pf/um / 1um)
+  // Nangate45.rc provides: R in kohm/um, C in pf/um - already the correct per-length values.
+  wire_r_per_um_ = 0.0;
+  wire_c_per_um_ = 0.0;
+  if (estimate_parasitics_) {
+    sta::Corners* corners = open_sta_->corners();
+    if (corners && corners->count() > 0) {
+      sta::Corner* corner = *corners->begin();
+      if (corner) {
+        // kohm/m → ohm/um: multiply by 1e-3
+        // pf/m → fF/um: multiply by 1e-3
+        double r_kohm_per_m = estimate_parasitics_->wireSignalResistance(corner);
+        double c_pf_per_m = estimate_parasitics_->wireSignalCapacitance(corner);
+        wire_r_per_um_ = r_kohm_per_m * 1e-3;  // kohm/m → ohm/um
+        wire_c_per_um_ = c_pf_per_m * 1e-3;    // pf/m → fF/um
+        logger_->report(
+            "[DEBUG] Wire RC: r_kohm/m={:.4e}, c_pf/m={:.4e} → R={:.4e} ohm/um, C={:.4e} fF/um",
+            r_kohm_per_m, c_pf_per_m, wire_r_per_um_, wire_c_per_um_);
+      }
+    }
+  }
+  logger_->report(
+      "[DEBUG] Wire RC from OpenROAD: R={:.4e} ohm/um, C={:.4e} fF/um",
+      wire_r_per_um_, wire_c_per_um_);
+
   sta::PinSet ends(open_sta_->getDbNetwork());
 
   getEndPoints(ends, is_area_mode_, max_depth);
   
   if (!ends.empty()) {
-    if (is_area_mode_) {
-      sta::PinSet boundary_points = resizer_->findFaninFanouts(ends);
-      logger_->report("Found {} pins in extracted logic.",
-                      boundary_points.size());
+    // Area mode 和 Delay mode 都使用 findFaninFanouts
+    sta::PinSet boundary_points = resizer_->findFaninFanouts(ends);
+    logger_->report("Found {} pins in extracted logic.",
+                    boundary_points.size());
+    
+    for (const sta::Pin* pin : boundary_points) {
+      odb::dbITerm* term = nullptr;
+      odb::dbBTerm* port = nullptr;
+      odb::dbModITerm* moditerm = nullptr;
+      open_sta_->getDbNetwork()->staToDb(pin, term, port, moditerm);
       
-      for (const sta::Pin* pin : boundary_points) {
-        odb::dbITerm* term = nullptr;
-        odb::dbBTerm* port = nullptr;
-        odb::dbModITerm* moditerm = nullptr;
-        open_sta_->getDbNetwork()->staToDb(pin, term, port, moditerm);
-        
-        if (term && !term->getInst()->getMaster()->isBlock()) {
-          path_insts_.insert(term->getInst());
-        }
+      if (term && !term->getInst()->getMaster()->isBlock()) {
+        path_insts_.insert(term->getInst());
       }
-    } else {
-      ConeSelectionConfig config;
-      config.max_cone_depth = max_depth;
-      config.delay_threshold_ratio = 0.3;     
-      config.max_cone_size = 500;              
-      config.min_improvement_threshold = 0.05;
-      config.distance_threshold_um = 50.0;  // 50 um threshold for physical distance
-
-      selectConeByPathDelay(config);
     }
 
     logger_->report("Found {} instances for restructuring.",
@@ -650,6 +631,12 @@ void Restructure::runABC()
       // call linked abc
       Abc_Start();
       Abc_Frame_t* abc_frame = Abc_FrameGetGlobalFrame();
+
+      // Set wire RC from OpenROAD directly (bypass coords file)
+      Abc_FrameSetWireRC(
+          static_cast<float>(wire_r_per_um_),
+          static_cast<float>(wire_c_per_um_));
+
       const std::string command = "source " + abc_script_file;
       child_proc[curr_mode_idx]
           = Cmd_CommandExecute(abc_frame, command.c_str());
@@ -738,22 +725,113 @@ void Restructure::postABC(float worst_slack)
 {
   // Leave the parasitics up to date.
   estimate_parasitics_->estimateWireParasitics();
+  
+  logger_->report("postABC called - is_area_mode: {}, path_insts size: {}", 
+                  is_area_mode_, path_insts_.size());
+  
+  // Calculate and report wire delay, cell delay, and total delay
+  if (!is_area_mode_ && !path_insts_.empty()) {
+    double total_cell_delay = 0.0;
+    double total_wire_delay = 0.0;
+    int cell_count = 0;
+    
+    open_sta_->ensureGraph();
+    open_sta_->searchPreamble();
+    sta::Graph* graph = open_sta_->graph();
+    
+    // For each instance in the path, get timing information
+    for (auto inst : path_insts_) {
+      odb::dbInst* db_inst = inst;
+      
+      // Iterate through all pins of this instance
+      for (odb::dbITerm* iterm : db_inst->getITerms()) {
+        if (!iterm->isConnected())
+          continue;
+        
+        const sta::Pin* pin = open_sta_->getDbNetwork()->dbToSta(iterm);
+        if (!pin)
+          continue;
+        
+        // Skip input pins - only get delays from output pins
+        sta::PortDirection* dir = open_sta_->getDbNetwork()->direction(pin);
+        if (!dir || !dir->isOutput())
+          continue;
+        
+        // Get the vertex for this pin
+        sta::Vertex* vertex = graph->pinLoadVertex(pin);
+        if (!vertex)
+          continue;
+        
+        // Get cell delay (from vertex arrival)
+        sta::Arrival arrival = open_sta_->vertexArrival(vertex, sta::MinMax::max());
+        
+        // Get wire delay from the net connected to this pin
+        odb::dbNet* net = iterm->getNet();
+        if (!net)
+          continue;
+        
+        // Estimate wire length from instance coordinates
+        odb::dbBox* bbox = db_inst->getBBox();
+        if (bbox) {
+          double inst_x = (bbox->xMin() + bbox->xMax()) / 2.0;
+          double inst_y = (bbox->yMin() + bbox->yMax()) / 2.0;
+          
+          // Find connected instances to estimate wire length
+          for (odb::dbITerm* other_iterm : net->getITerms()) {
+            if (other_iterm == iterm)
+              continue;
+            
+            odb::dbInst* other_inst = other_iterm->getInst();
+            if (!other_inst)
+              continue;
+            
+            odb::dbBox* other_bbox = other_inst->getBBox();
+            if (!other_bbox)
+              continue;
+            
+            double other_x = (other_bbox->xMin() + other_bbox->xMax()) / 2.0;
+            double other_y = (other_bbox->yMin() + other_bbox->yMax()) / 2.0;
+            
+            // Manhattan distance (approximate wire length in um)
+            double wire_length_um = std::abs(inst_x - other_x) + std::abs(inst_y - other_y);
+            
+            // Wire delay = R * C
+            // Approximate R ~ 0.1 ohm/um, C ~ 0.1 fF/um
+            // wire_delay (ps) = R(ohm/um) * length(um) * C(fF/um)
+            double wire_delay_ps = wire_length_um * 0.1 * 0.1; 
+            
+            total_wire_delay += wire_delay_ps;
+          }
+        }
+        
+        total_cell_delay += arrival * 1e9; // Convert ns to ps
+        cell_count++;
+      }
+    }
+    
+    if (cell_count > 0) {
+      double avg_cell_delay_ps = total_cell_delay / cell_count;
+      double avg_wire_delay_ps = total_wire_delay / cell_count;
+      double total_delay_ps = avg_cell_delay_ps + avg_wire_delay_ps;
+      
+      logger_->report("Delay Analysis:");
+      logger_->report("  Average Cell Delay: {:.2f} ps", avg_cell_delay_ps);
+      logger_->report("  Average Wire Delay: {:.2f} ps", avg_wire_delay_ps);
+      logger_->report("  Average Total Delay: {:.2f} ps", total_delay_ps);
+    }
+  }
 }
 void Restructure::getEndPoints(sta::PinSet& ends,
                                bool area_mode,
                                unsigned max_depth)
 {
   auto sta_state = open_sta_->search();
-  sta::VertexSet* end_points = sta_state->endpoints();
-  std::size_t path_found = end_points->size();
-  debugPrint(logger_, RMP, "remap", 1, "Number of paths for restructure are {}", path_found);
-  for (auto& end_point : *end_points) {
+  sta::VertexSet* end_points_ptr = sta_state->endpoints();
+  for (auto& end_point : *end_points_ptr) {
     if (!is_area_mode_) {
       sta::Path* path
           = open_sta_->vertexWorstSlackPath(end_point, sta::MinMax::max());
       sta::PathExpanded expanded(path, open_sta_);
-      // Members in expanded include gate output and net so divide by 2
-      debugPrint(logger_, RMP, "remap", 1, "Found path of depth {}", expanded.size() / 2);
       if (expanded.size() / 2 > max_depth) {
         ends.insert(end_point->pin());
         // Use only one end point to limit blob size for timing
@@ -766,13 +844,14 @@ void Restructure::getEndPoints(sta::PinSet& ends,
 
   // unconstrained end points
   if (is_area_mode_) {
-    auto errors = open_sta_->checkTiming(false /*no_input_delay*/,
-                                         false /*no_output_delay*/,
-                                         false /*reg_multiple_clks*/,
-                                         true /*reg_no_clks*/,
-                                         true /*unconstrained_endpoints*/,
-                                         false /*loops*/,
-                                         false /*generated_clks*/);
+    auto& errors = open_sta_->checkTiming(
+        false /*no_input_delay*/,
+        false /*no_output_delay*/,
+        false /*reg_multiple_clks*/,
+        true /*reg_no_clks*/,
+        true /*unconstrained_endpoints*/,
+        false /*loops*/,
+        false /*generated_clks*/);
     debugPrint(logger_, RMP, "remap", 1, "Size of errors = {}", errors.size());
     if (!errors.empty() && errors[0]->size() > 1) {
       sta::CheckError* error = errors[0];
@@ -1074,23 +1153,30 @@ void Restructure::writeInstanceCoordinates(const std::string& file_name)
     return;
   }
 
-  // Write header comment
+  // Coordinates are stored in DBU (usually nanometers), convert to microns for ABC
+  int dbu_per_um = block_->getDbUnitsPerMicron();
+
+  // Write header comment with wire RC (read_coords parses "# wire_rc R C")
+  // wire_r_per_um_ is already in ohm/um, wire_c_per_um_ is already in fF/um
   coord_file << "# Instance coordinates for ABC-aware remapping\n";
-  coord_file << "# Format: instance_name x y\n";
+  coord_file << "# wire_rc " << std::scientific << wire_r_per_um_ << " " << wire_c_per_um_ << "\n";
+  coord_file << "# Format: instance_name x(um) y(um)\n";
 
   // Write number of instances
   coord_file << path_insts_.size() << "\n";
 
-  // Write each instance coordinate
+  // Write each instance coordinate (in microns)
   for (auto inst : path_insts_) {
     const odb::Point origin = inst->getOrigin();
-    coord_file << inst->getName() << " " << origin.x() << " " << origin.y() << "\n";
+    coord_file << inst->getName() << " "
+               << (double)origin.x() / dbu_per_um << " "
+               << (double)origin.y() / dbu_per_um << "\n";
   }
 
   coord_file.close();
   debugPrint(logger_, RMP, "remap", 1,
-             "Wrote {} instance coordinates to {}",
-             path_insts_.size(), file_name);
+             "Wrote {} instance coordinates to {} (DBU/um={}, wire RC: R={:.3e} ohm/um, C={:.3e} fF/um)",
+             path_insts_.size(), file_name, dbu_per_um, wire_r_per_um_, wire_c_per_um_);
 }
 
 bool Restructure::readAbcLog(const std::string& abc_file_name,
