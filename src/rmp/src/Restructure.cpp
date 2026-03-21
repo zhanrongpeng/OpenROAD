@@ -1023,9 +1023,9 @@ bool Restructure::writeAbcScript(const std::string& file_name)
            << '\n';
   }
 
-  // Physical-aware mapping: skip rewrite/refactor, use strash + read_coords + if
+  // Physical-aware mapping: skip rewrite/refactor
+  // Wire RC is set directly via Abc_FrameSetWireRC() in C++ before sourcing this script
   script << "strash\n";
-  script << "read_coords " << coord_file_name_ << '\n';
 
   // Use if command with wire-aware mapping (-W flag)
   // WireDelayFactor 0.001 = 1nm per unit wirelength (scaled)
