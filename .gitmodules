@@ -1,8 +1,6 @@
 [submodule "module/OpenSTA"]
 	path = src/sta
 	url = ../../The-OpenROAD-Project/OpenSTA.git
-[submodule "src/abc"]
-	path = third-party/abc
-	url = git@github.com:zhanrongpeng/abc.git
 [submodule "third-party/abc"]
+	path = third-party/abc
 	url = git@github.com:zhanrongpeng/abc.git
