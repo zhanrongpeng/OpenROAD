@@ -1178,45 +1178,73 @@ void Restructure::writeNetCoordinates(const std::string& file_name)
 
   int dbu_per_um = block_->getDbUnitsPerMicron();
 
-  // Collect unique (net_name -> output_pin_position) mappings.
-  // One net is driven by exactly one output pin, so deduplicate by net name.
-  // This mirrors phyls: cut.pins = AIG node indices, np[node_idx] = position.
-  // Here: net_name = ABC node name (strash preserves output net name),
-  // output pin position = physical location of the driving pin.
-  std::map<std::string, std::pair<double, double>> net_coords;
+  // Collect all nets connected to instances in the cone, then write the
+  // physical position of each net (net_name -> any connected pin position).
+  //
+  // Coordinate lookup in ABC (ifTime.c):
+  //   - vNodeNameMap[leafId] -> blif node -> Abc_ObjName() = net name
+  //   - vNodeDrivingPoName[nodeId] = PO name for CIs driving POs
+  // So every net in the cone needs an entry, including:
+  //   (a) OUTPUT nets  driven by a cell in path_insts_  -> getAvgXY on OUTPUT iterm
+  //   (b) INPUT/PI nets whose fanin cell is outside cone -> getAvgXY on INPUT iterm
+  //       (the input pin is on a cell inside path_insts_)
+  //
+  // Since getAvgXY() returns the pin's routing-shape center, using INPUT iterm
+  // position is equally valid (both iterms of the same net are close together).
+  std::set<odb::dbNet*> cone_nets;
 
   for (auto inst : path_insts_) {
     for (odb::dbITerm* iterm : inst->getITerms()) {
-      if (iterm->getIoType() != odb::dbIoType::OUTPUT) {
+      if (!iterm->isConnected())
         continue;
-      }
-      odb::dbNet* net = iterm->getNet();
-      if (net == nullptr) {
-        continue;
-      }
       if (iterm->getSigType() == odb::dbSigType::POWER
-          || iterm->getSigType() == odb::dbSigType::GROUND) {
+          || iterm->getSigType() == odb::dbSigType::GROUND)
         continue;
-      }
-
-        // Get output pin physical position (pin center, not cell origin)
-      int px, py;
-      if (iterm->getAvgXY(&px, &py)) {
-        std::string netName = net->getName();
-        static int dbg_net = 0;
-        if ( dbg_net < 5 )
-        {
-          dbg_net++;
-          logger_->report("[DBG] writeNetCoordinates: inst={} iterm={} netName=\"{}\" pin=({},{})",
-              inst->getName(), iterm->getName(), netName, px, py);
-        }
-        net_coords[netName] = {
-          static_cast<double>(px) / dbu_per_um,
-          static_cast<double>(py) / dbu_per_um
-        };
-      }
+      odb::dbNet* net = iterm->getNet();
+      if (net)
+        cone_nets.insert(net);
     }
   }
+
+  std::map<std::string, std::pair<double, double>> net_coords;
+  int nets_with_position = 0;
+  int nets_without_position = 0;
+
+  for (odb::dbNet* net : cone_nets) {
+    std::string netName = net->getName();
+
+    // Try all connected iterms (input and output); use whichever has getAvgXY
+    int px = 0, py = 0;
+    bool found = false;
+    for (odb::dbITerm* iterm : net->getITerms()) {
+      if (iterm->getSigType() == odb::dbSigType::POWER
+          || iterm->getSigType() == odb::dbSigType::GROUND)
+        continue;
+      if (iterm->getAvgXY(&px, &py)) {
+        found = true;
+        break;  // first hit is sufficient (all iterms of same net are close)
+      }
+    }
+
+    if (found) {
+      static int dbg_net = 0;
+      if (dbg_net < 5) {
+        dbg_net++;
+        logger_->report("[DBG] writeNetCoordinates: netName=\"{}\" pin=({},{})",
+            netName, px, py);
+      }
+      net_coords[netName] = {
+        static_cast<double>(px) / dbu_per_um,
+        static_cast<double>(py) / dbu_per_um
+      };
+      nets_with_position++;
+    } else {
+      nets_without_position++;
+    }
+  }
+
+  logger_->report("[DBG] writeNetCoordinates: cone_nets={}, with_position={}, without_position={}",
+      cone_nets.size(), nets_with_position, nets_without_position);
 
   coord_file << "# Net-to-output-pin coordinates for ABC wire-aware mapping\n";
   coord_file << "# wire_rc " << std::scientific << wire_r_per_um_ << " " << wire_c_per_um_ << "\n";
