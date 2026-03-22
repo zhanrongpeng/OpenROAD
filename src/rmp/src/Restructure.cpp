@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 #include <cmath>
+#include <map>
 #include <queue>
 
 #include "annealing_strategy.h"
@@ -582,8 +583,8 @@ void Restructure::runABC()
       logger_, RMP, "remap", 1, "Writing blif file {}", input_blif_file_name_);
   files_to_remove.emplace_back(input_blif_file_name_);
 
-  // Write instance coordinates for ABC
-  writeInstanceCoordinates(coord_file_name_);
+  // Write net coordinates (net_name -> output_pin_position) for ABC wire-aware mapping
+  writeNetCoordinates(coord_file_name_);
   files_to_remove.emplace_back(coord_file_name_);
 
   // abc optimization
@@ -725,98 +726,117 @@ void Restructure::postABC(float worst_slack)
 {
   // Leave the parasitics up to date.
   estimate_parasitics_->estimateWireParasitics();
-  
-  logger_->report("postABC called - is_area_mode: {}, path_insts size: {}", 
+
+  logger_->report("postABC called - is_area_mode: {}, path_insts size: {}",
                   is_area_mode_, path_insts_.size());
-  
-  // Calculate and report wire delay, cell delay, and total delay
+
+  // Calculate and report wire delay, cell delay, and total delay.
+  // For each net in the cone:
+  //   - Driver position: output pin center via getAvgXY()  (um)
+  //   - Wirelength to each fanout: Manhattan distance      (um)
+  //   - Wire delay (Elmore): R * C * L^2 / 2              (ps)
+  //   - Cell delay: vertex arrival time                    (ns → ps)
+  //   - Total: cell_delay + worst_wire_delay per net
   if (!is_area_mode_ && !path_insts_.empty()) {
-    double total_cell_delay = 0.0;
-    double total_wire_delay = 0.0;
-    int cell_count = 0;
-    
+    int dbu_per_um = block_->getDbUnitsPerMicron();
+
+    // Use actual wire RC from OpenROAD; fall back to 0.1 ohm/um / 0.1 fF/um if unavailable
+    double r_ohm_um = (wire_r_per_um_ > 0.0) ? wire_r_per_um_ : 0.1;
+    double c_ff_um  = (wire_c_per_um_ > 0.0) ? wire_c_per_um_ : 0.1;
+
+    double total_cell_delay_ps = 0.0;
+    double total_wire_delay_ps = 0.0;
+    int net_count = 0;
+    int driver_count = 0;
+
+    // Deduplicate by net so each net contributes once (one driver, worst fanout distance)
+    std::set<odb::dbNet*> seen_nets;
+    std::set<sta::Vertex*> seen_vertices;
+
     open_sta_->ensureGraph();
     open_sta_->searchPreamble();
     sta::Graph* graph = open_sta_->graph();
-    
-    // For each instance in the path, get timing information
+
     for (auto inst : path_insts_) {
-      odb::dbInst* db_inst = inst;
-      
-      // Iterate through all pins of this instance
-      for (odb::dbITerm* iterm : db_inst->getITerms()) {
+      for (odb::dbITerm* iterm : inst->getITerms()) {
         if (!iterm->isConnected())
           continue;
-        
-        const sta::Pin* pin = open_sta_->getDbNetwork()->dbToSta(iterm);
-        if (!pin)
+        if (iterm->getIoType() != odb::dbIoType::OUTPUT)
           continue;
-        
-        // Skip input pins - only get delays from output pins
-        sta::PortDirection* dir = open_sta_->getDbNetwork()->direction(pin);
-        if (!dir || !dir->isOutput())
+        if (iterm->getSigType() == odb::dbSigType::POWER
+            || iterm->getSigType() == odb::dbSigType::GROUND)
           continue;
-        
-        // Get the vertex for this pin
-        sta::Vertex* vertex = graph->pinLoadVertex(pin);
-        if (!vertex)
-          continue;
-        
-        // Get cell delay (from vertex arrival)
-        sta::Arrival arrival = open_sta_->vertexArrival(vertex, sta::MinMax::max());
-        
-        // Get wire delay from the net connected to this pin
+
         odb::dbNet* net = iterm->getNet();
         if (!net)
           continue;
-        
-        // Estimate wire length from instance coordinates
-        odb::dbBox* bbox = db_inst->getBBox();
-        if (bbox) {
-          double inst_x = (bbox->xMin() + bbox->xMax()) / 2.0;
-          double inst_y = (bbox->yMin() + bbox->yMax()) / 2.0;
-          
-          // Find connected instances to estimate wire length
-          for (odb::dbITerm* other_iterm : net->getITerms()) {
-            if (other_iterm == iterm)
-              continue;
-            
-            odb::dbInst* other_inst = other_iterm->getInst();
-            if (!other_inst)
-              continue;
-            
-            odb::dbBox* other_bbox = other_inst->getBBox();
-            if (!other_bbox)
-              continue;
-            
-            double other_x = (other_bbox->xMin() + other_bbox->xMax()) / 2.0;
-            double other_y = (other_bbox->yMin() + other_bbox->yMax()) / 2.0;
-            
-            // Manhattan distance (approximate wire length in um)
-            double wire_length_um = std::abs(inst_x - other_x) + std::abs(inst_y - other_y);
-            
-            // Wire delay = R * C
-            // Approximate R ~ 0.1 ohm/um, C ~ 0.1 fF/um
-            // wire_delay (ps) = R(ohm/um) * length(um) * C(fF/um)
-            double wire_delay_ps = wire_length_um * 0.1 * 0.1; 
-            
-            total_wire_delay += wire_delay_ps;
-          }
+        if (seen_nets.count(net))
+          continue;  // already processed this net
+        seen_nets.insert(net);
+
+        const sta::Pin* pin = open_sta_->getDbNetwork()->dbToSta(iterm);
+        if (!pin)
+          continue;
+        sta::PortDirection* dir = open_sta_->getDbNetwork()->direction(pin);
+        if (!dir || !dir->isOutput())
+          continue;
+
+        // Driver position: output pin center via getAvgXY()
+        int dpx, dpy;
+        if (!iterm->getAvgXY(&dpx, &dpy))
+          continue;
+        double driver_x = static_cast<double>(dpx) / dbu_per_um;
+        double driver_y = static_cast<double>(dpy) / dbu_per_um;
+
+        // Worst fanout wirelength (Manhattan distance)
+        double worst_wirelength_um = 0.0;
+        for (odb::dbITerm* other_iterm : net->getITerms()) {
+          if (other_iterm == iterm)
+            continue;
+          odb::dbInst* other_inst = other_iterm->getInst();
+          if (!other_inst)
+            continue;
+
+          int opx, opy;
+          if (!other_iterm->getAvgXY(&opx, &opy))
+            continue;
+
+          double ox = static_cast<double>(opx) / dbu_per_um;
+          double oy = static_cast<double>(opy) / dbu_per_um;
+          double dist = std::abs(driver_x - ox) + std::abs(driver_y - oy);
+          if (dist > worst_wirelength_um)
+            worst_wirelength_um = dist;
         }
-        
-        total_cell_delay += arrival * 1e9; // Convert ns to ps
-        cell_count++;
+
+        // Elmore wire delay: R * C * L^2 / 2  (ps)
+        // R [ohm/um] * C [fF/um] * L^2 [um^2] * 0.5 * 1e-3 = fF*ohm*um^2/um^2*0.001 = pC*ohm = ps
+        double wire_delay_ps = r_ohm_um * c_ff_um
+                             * worst_wirelength_um * worst_wirelength_um * 0.5 * 1e-3;
+        total_wire_delay_ps += wire_delay_ps;
+        net_count++;
+
+        // Cell delay: vertex arrival time (ns → ps)
+        sta::Vertex* vertex = graph->pinLoadVertex(pin);
+        if (vertex && !seen_vertices.count(vertex)) {
+          seen_vertices.insert(vertex);
+          sta::Arrival arrival = open_sta_->vertexArrival(vertex, sta::MinMax::max());
+          total_cell_delay_ps += sta::delayAsFloat(arrival) * 1e9;
+          driver_count++;
+        }
       }
     }
-    
-    if (cell_count > 0) {
-      double avg_cell_delay_ps = total_cell_delay / cell_count;
-      double avg_wire_delay_ps = total_wire_delay / cell_count;
+
+    if (net_count > 0) {
+      double avg_cell_delay_ps = total_cell_delay_ps / driver_count;
+      double avg_wire_delay_ps = total_wire_delay_ps / net_count;
       double total_delay_ps = avg_cell_delay_ps + avg_wire_delay_ps;
-      
-      logger_->report("Delay Analysis:");
+
+      logger_->report("Delay Analysis (Elmore wire model):");
+      logger_->report("  Wire RC: R={:.4e} ohm/um, C={:.4e} fF/um", r_ohm_um, c_ff_um);
+      logger_->report("  Nets processed: {}", net_count);
+      logger_->report("  Drivers processed: {}", driver_count);
       logger_->report("  Average Cell Delay: {:.2f} ps", avg_cell_delay_ps);
-      logger_->report("  Average Wire Delay: {:.2f} ps", avg_wire_delay_ps);
+      logger_->report("  Average Wire Delay (Elmore): {:.2f} ps", avg_wire_delay_ps);
       logger_->report("  Average Total Delay: {:.2f} ps", total_delay_ps);
     }
   }
@@ -1027,6 +1047,9 @@ bool Restructure::writeAbcScript(const std::string& file_name)
   // Wire RC is set directly via Abc_FrameSetWireRC() in C++ before sourcing this script
   script << "strash\n";
 
+  // Read coordinates for wire-aware mapping (sets pAbc->pNtkCoords and wire RC)
+  script << "read_coords " << coord_file_name_ << '\n';
+
   // Use if command with wire-aware mapping (-W flag)
   // WireDelayFactor 0.001 = 1nm per unit wirelength (scaled)
   script << "if -W 0.001\n";
@@ -1145,7 +1168,7 @@ void Restructure::setTieLoPort(sta::LibertyPort* tieLoPort)
   }
 }
 
-void Restructure::writeInstanceCoordinates(const std::string& file_name)
+void Restructure::writeNetCoordinates(const std::string& file_name)
 {
   std::ofstream coord_file(file_name.c_str());
   if (!coord_file.is_open()) {
@@ -1153,30 +1176,61 @@ void Restructure::writeInstanceCoordinates(const std::string& file_name)
     return;
   }
 
-  // Coordinates are stored in DBU (usually nanometers), convert to microns for ABC
   int dbu_per_um = block_->getDbUnitsPerMicron();
 
-  // Write header comment with wire RC (read_coords parses "# wire_rc R C")
-  // wire_r_per_um_ is already in ohm/um, wire_c_per_um_ is already in fF/um
-  coord_file << "# Instance coordinates for ABC-aware remapping\n";
-  coord_file << "# wire_rc " << std::scientific << wire_r_per_um_ << " " << wire_c_per_um_ << "\n";
-  coord_file << "# Format: instance_name x(um) y(um)\n";
+  // Collect unique (net_name -> output_pin_position) mappings.
+  // One net is driven by exactly one output pin, so deduplicate by net name.
+  // This mirrors phyls: cut.pins = AIG node indices, np[node_idx] = position.
+  // Here: net_name = ABC node name (strash preserves output net name),
+  // output pin position = physical location of the driving pin.
+  std::map<std::string, std::pair<double, double>> net_coords;
 
-  // Write number of instances
-  coord_file << path_insts_.size() << "\n";
-
-  // Write each instance coordinate (in microns)
   for (auto inst : path_insts_) {
-    const odb::Point origin = inst->getOrigin();
-    coord_file << inst->getName() << " "
-               << (double)origin.x() / dbu_per_um << " "
-               << (double)origin.y() / dbu_per_um << "\n";
+    for (odb::dbITerm* iterm : inst->getITerms()) {
+      if (iterm->getIoType() != odb::dbIoType::OUTPUT) {
+        continue;
+      }
+      odb::dbNet* net = iterm->getNet();
+      if (net == nullptr) {
+        continue;
+      }
+      if (iterm->getSigType() == odb::dbSigType::POWER
+          || iterm->getSigType() == odb::dbSigType::GROUND) {
+        continue;
+      }
+
+        // Get output pin physical position (pin center, not cell origin)
+      int px, py;
+      if (iterm->getAvgXY(&px, &py)) {
+        std::string netName = net->getName();
+        static int dbg_net = 0;
+        if ( dbg_net < 5 )
+        {
+          dbg_net++;
+          logger_->report("[DBG] writeNetCoordinates: inst={} iterm={} netName=\"{}\" pin=({},{})",
+              inst->getName(), iterm->getName(), netName, px, py);
+        }
+        net_coords[netName] = {
+          static_cast<double>(px) / dbu_per_um,
+          static_cast<double>(py) / dbu_per_um
+        };
+      }
+    }
+  }
+
+  coord_file << "# Net-to-output-pin coordinates for ABC wire-aware mapping\n";
+  coord_file << "# wire_rc " << std::scientific << wire_r_per_um_ << " " << wire_c_per_um_ << "\n";
+  coord_file << "# Format: net_name x(um) y(um)\n";
+  coord_file << net_coords.size() << "\n";
+
+  for (const auto& [net_name, coord] : net_coords) {
+    coord_file << net_name << " " << coord.first << " " << coord.second << "\n";
   }
 
   coord_file.close();
   debugPrint(logger_, RMP, "remap", 1,
-             "Wrote {} instance coordinates to {} (DBU/um={}, wire RC: R={:.3e} ohm/um, C={:.3e} fF/um)",
-             path_insts_.size(), file_name, dbu_per_um, wire_r_per_um_, wire_c_per_um_);
+             "Wrote {} net->output_pin coordinates to {} (DBU/um={}, wire RC: R={:.3e} ohm/um, C={:.3e} fF/um)",
+             net_coords.size(), file_name, dbu_per_um, wire_r_per_um_, wire_c_per_um_);
 }
 
 bool Restructure::readAbcLog(const std::string& abc_file_name,

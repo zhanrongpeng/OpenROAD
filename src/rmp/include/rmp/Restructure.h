@@ -171,7 +171,7 @@ class Restructure
   void postABC(float worst_slack);
   bool writeAbcScript(const std::string& file_name);
   void writeOptCommands(std::ofstream& script);
-  void writeInstanceCoordinates(const std::string& file_name);
+  void writeNetCoordinates(const std::string& file_name);
   void initDB();
   void getEndPoints(sta::PinSet& ends, bool area_mode, unsigned max_depth);
   int countConsts(odb::dbBlock* top_block);
