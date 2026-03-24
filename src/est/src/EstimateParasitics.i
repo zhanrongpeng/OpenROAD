@@ -202,6 +202,34 @@ set_v_wire_clk_rc_cmd(const Corner *corner,
   estimate_parasitics->setVWireClkRC(corner, res, cap);
 }
 
+// Store wire RC in user's natural units (ohm/um, fF/um) for wire-aware ABC mapping.
+void
+set_wire_rc_um_cmd(const Corner *corner,
+                    float res_ohm_per_um,
+                    float cap_ff_per_um)
+{
+  ensureLinked();
+  est::EstimateParasitics *estimate_parasitics = getEstimateParasitics();
+  estimate_parasitics->setWireSignalRCUm(corner, res_ohm_per_um, cap_ff_per_um);
+}
+
+// Retrieve wire RC in user's natural units (ohm/um, fF/um).
+double
+wire_signal_resistance_um_cmd(const Corner *corner)
+{
+  ensureLinked();
+  est::EstimateParasitics *estimate_parasitics = getEstimateParasitics();
+  return estimate_parasitics->wireSignalResistanceUm(corner);
+}
+
+double
+wire_signal_capacitance_uf_cmd(const Corner *corner)
+{
+  ensureLinked();
+  est::EstimateParasitics *estimate_parasitics = getEstimateParasitics();
+  return estimate_parasitics->wireSignalCapacitanceUf(corner);
+}
+
 // ohms/meter
 double
 wire_signal_resistance(const Corner *corner)

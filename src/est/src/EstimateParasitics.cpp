@@ -172,6 +172,40 @@ void EstimateParasitics::setVWireSignalRC(const Corner* corner,
   wire_signal_cap_[corner->index()].v_cap = cap;
 }
 
+void EstimateParasitics::setWireSignalRCUm(const Corner* corner,
+                                          double res_ohm_per_um,
+                                          double cap_ff_per_um)
+{
+  const int idx = corner->index();
+  const int n_corners = sta_->corners()->count();
+  wire_signal_res_um_.resize(n_corners);
+  wire_signal_cap_uf_.resize(n_corners);
+  wire_signal_res_um_[idx].h_res = res_ohm_per_um;
+  wire_signal_res_um_[idx].v_res = res_ohm_per_um;
+  wire_signal_cap_uf_[idx].h_cap = cap_ff_per_um;
+  wire_signal_cap_uf_[idx].v_cap = cap_ff_per_um;
+}
+
+double EstimateParasitics::wireSignalResistanceUm(const Corner* corner) const
+{
+  if (wire_signal_res_um_.empty()) {
+    return 0.0;
+  }
+  return (wire_signal_res_um_[corner->index()].h_res
+          + wire_signal_res_um_[corner->index()].v_res)
+         / 2;
+}
+
+double EstimateParasitics::wireSignalCapacitanceUf(const Corner* corner) const
+{
+  if (wire_signal_cap_uf_.empty()) {
+    return 0.0;
+  }
+  return (wire_signal_cap_uf_[corner->index()].h_cap
+          + wire_signal_cap_uf_[corner->index()].v_cap)
+         / 2;
+}
+
 double EstimateParasitics::wireSignalResistance(const Corner* corner) const
 {
   if (wire_signal_res_.empty()) {

@@ -74,32 +74,44 @@ proc set_layer_rc { args } {
     }
 
     set cap 0.0
+    set cap_ff_per_um 0.0
     if { [info exists keys(-capacitance)] } {
       set cap $keys(-capacitance)
       sta::check_positive_float "-capacitance" $cap
-      # F/m
-      set cap [expr [sta::capacitance_ui_sta $cap] / [sta::distance_ui_sta 1.0]]
+      # STA internal: F/m
+      set cap_sta [expr [sta::capacitance_ui_sta $cap] / [sta::distance_ui_sta 1.0]]
+      # Save the original UI value in fF/um for wire-aware ABC mapping
+      set cap_ff_per_um $cap
     }
 
     set res 0.0
+    set res_ohm_per_um 0.0
     if { [info exists keys(-resistance)] } {
       set res $keys(-resistance)
       sta::check_positive_float "-resistance" $res
-      # ohm/m
-      set res [expr [sta::resistance_ui_sta $res] / [sta::distance_ui_sta 1.0]]
+      # STA internal: ohm/m
+      set res_sta [expr [sta::resistance_ui_sta $res] / [sta::distance_ui_sta 1.0]]
+      # Save the original UI value in ohm/um for wire-aware ABC mapping
+      set res_ohm_per_um $res
     }
 
     if { $corners == "NULL" } {
       set corners [sta::corners]
       # Only update the db layers if -corner not specified.
-      est::set_dblayer_wire_rc $layer $res $cap
+      est::set_dblayer_wire_rc $layer $res_sta $cap_sta
     }
 
     foreach corner $corners {
-      est::set_layer_rc_cmd $layer $corner $res $cap
+      est::set_layer_rc_cmd $layer $corner $res_sta $cap_sta
     }
     # Also add this layer to signal_layers_ so estimate_parasitics sees non-empty RC
     est::add_signal_layer_cmd $layer
+    # Store raw UI values (ohm/um, fF/um) for wire-aware ABC mapping in Restructure
+    if { $res_ohm_per_um > 0.0 && $cap_ff_per_um > 0.0 } {
+      foreach corner $corners {
+        est::set_wire_rc_um_cmd $corner $res_ohm_per_um $cap_ff_per_um
+      }
+    }
   } elseif { [info exists keys(-via)] } {
     set layer_name $keys(-via)
     set layer [$tech findLayer $layer_name]
@@ -312,6 +324,20 @@ proc set_wire_rc { args } {
     if { ![info exists flags(-clock)] && ![info exists flags(-signal)] } {
       est::add_clk_layer_cmd $tec_layer
       est::add_signal_layer_cmd $tec_layer
+    }
+
+    # Store raw UI values (ohm/um, fF/um) for wire-aware ABC mapping in Restructure.
+    # dblayer_wire_rc returns R in ohm/m, C in F/m.  Convert to ohm/um and fF/um.
+    if { $h_wire_res > 0.0 && $h_wire_cap > 0.0 } {
+      set res_ohm_per_um [expr $h_wire_res / 1e6]
+      set cap_ff_per_um  [expr $h_wire_cap * 1e9]
+      if { $corner == "NULL" } {
+        foreach corner [sta::corners] {
+          est::set_wire_rc_um_cmd $corner $res_ohm_per_um $cap_ff_per_um
+        }
+      } else {
+        est::set_wire_rc_um_cmd $corner $res_ohm_per_um $cap_ff_per_um
+      }
     }
   } else {
     ord::ensure_units_initialized

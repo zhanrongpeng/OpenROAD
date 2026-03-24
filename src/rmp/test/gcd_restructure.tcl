@@ -5,8 +5,8 @@ read_def gcd_placed.def
 read_sdc gcd.sdc
 # set_layer_rc needs LEF layer info, so must come after read_lef
 source Nangate45/Nangate45.rc
-# Note: set_wire_rc -layer is NOT needed here; using it after set_layer_rc would
-# override the correct values because Nangate45.lef has no RESISTANCE on metal3.
+# set_wire_rc to use the layer RC values from set_layer_rc for wire parasitics
+set_wire_rc -layer metal3
 estimate_parasitics -placement
 
 report_worst_slack

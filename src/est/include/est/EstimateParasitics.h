@@ -133,6 +133,7 @@ class EstimateParasitics : public dbStaState
   void addClkLayer(odb::dbTechLayer* layer);
   void addSignalLayer(odb::dbTechLayer* layer);
   void sortClkAndSignalLayers();
+  std::vector<odb::dbTechLayer*> signalLayers() const { return signal_layers_; }
   // Set the resistance and capacitance used for horizontal parasitics on signal
   // nets.
   void setHWireSignalRC(const Corner* corner,
@@ -151,6 +152,13 @@ class EstimateParasitics : public dbStaState
   void setVWireClkRC(const Corner* corner,
                      double res,
                      double cap);  // farads/meter
+  // Store raw RC in user's natural units (ohm/um, fF/um) for wire-aware ABC mapping.
+  void setWireSignalRCUm(const Corner* corner,
+                          double res_ohm_per_um,
+                          double cap_ff_per_um);
+  // Retrieve raw RC in user's natural units.
+  double wireSignalResistanceUm(const Corner* corner) const;
+  double wireSignalCapacitanceUf(const Corner* corner) const;
   // ohms/meter, farads/meter
   void wireSignalRC(const Corner* corner,
                     // Return values.
@@ -280,6 +288,12 @@ class EstimateParasitics : public dbStaState
   // Signal wire RC indexed by corner->index
   std::vector<ParasiticsResistance> wire_signal_res_;   // ohms/metre
   std::vector<ParasiticsCapacitance> wire_signal_cap_;  // Farads/meter
+  // Raw RC for wire-aware ABC mapping.  These are stored in the user's
+  // natural units (ohm/um, fF/um) so they can be passed to ABC's Elmore
+  // model without any library-unit contamination.
+  std::vector<ParasiticsResistance> wire_signal_res_um_;  // ohm/um
+  std::vector<ParasiticsCapacitance> wire_signal_cap_uf_;  // fF/um
+
   // Clock wire RC.
   std::vector<ParasiticsResistance> wire_clk_res_;   // ohms/metre
   std::vector<ParasiticsCapacitance> wire_clk_cap_;  // Farads/meter

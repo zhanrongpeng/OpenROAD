@@ -507,32 +507,121 @@ void Restructure::getBlob(unsigned max_depth)
   open_sta_->ensureLevelized();
   open_sta_->searchPreamble();
 
-  // Compute wire RC from estimate_parasitics_
-  // wireSignalResistance() returns kohm/m (from set_layer_rc in kohm/um / 1um)
-  // wireSignalCapacitance() returns pf/m (from set_layer_rc in pf/um / 1um)
-  // Nangate45.rc provides: R in kohm/um, C in pf/um - already the correct per-length values.
+  // Priority: use estimate_parasitics_ RC (set by set_wire_rc / set_layer_rc).
+  // This is the same singleton that the TCL commands set, so after
+  // "set_wire_rc -layer metal3" it contains the correct per-layer RC.
   wire_r_per_um_ = 0.0;
   wire_c_per_um_ = 0.0;
+  // ─── Wire RC for ABC's Elmore delay model ─────────────────────────────────
+  //
+  // ABC (ifTime.c) uses wire_delay = R(ohm/um) * C(fF/um) * L(um)^2 * 0.5 * 1e-3.
+  //
+  // We read the raw UI values (ohm/um, fF/um) that were stored by set_layer_rc
+  // via the new set_wire_rc_um_cmd() API, bypassing OpenROAD's internal unit
+  // conversions (which apply the library's kohm/ff scale to the resistance value).
+  //
+  // Elmore verification with L=30.35um, R=3.574e-3 ohm/um, C=7.516e-2 fF/um:
+  //   wire_delay = 3.574e-3 * 7.516e-2 * (30.35)^2 * 0.5 * 1e-3
+  //              = 0.1237 ps  ← realistic wire delay
+  //
   if (estimate_parasitics_) {
     sta::Corners* corners = open_sta_->corners();
     if (corners && corners->count() > 0) {
       sta::Corner* corner = *corners->begin();
       if (corner) {
-        // kohm/m → ohm/um: multiply by 1e-3
-        // pf/m → fF/um: multiply by 1e-3
-        double r_kohm_per_m = estimate_parasitics_->wireSignalResistance(corner);
-        double c_pf_per_m = estimate_parasitics_->wireSignalCapacitance(corner);
-        wire_r_per_um_ = r_kohm_per_m * 1e-3;  // kohm/m → ohm/um
-        wire_c_per_um_ = c_pf_per_m * 1e-3;    // pf/m → fF/um
-        logger_->report(
-            "[DEBUG] Wire RC: r_kohm/m={:.4e}, c_pf/m={:.4e} → R={:.4e} ohm/um, C={:.4e} fF/um",
-            r_kohm_per_m, c_pf_per_m, wire_r_per_um_, wire_c_per_um_);
+        double r_ohm_per_um = estimate_parasitics_->wireSignalResistanceUm(corner);
+        double c_ff_per_um  = estimate_parasitics_->wireSignalCapacitanceUf(corner);
+        if (r_ohm_per_um > 0.0 && c_ff_per_um > 0.0) {
+          wire_r_per_um_ = r_ohm_per_um;  // already ohm/um
+          wire_c_per_um_ = c_ff_per_um;   // already fF/um
+          logger_->report(
+              "[DEBUG] Wire RC from set_layer_rc (UI units): "
+              "R={:.4e} ohm/um, C={:.4e} fF/um",
+              wire_r_per_um_, wire_c_per_um_);
+        } else {
+          logger_->report(
+              "[DEBUG] set_wire_rc_um not set, falling back to DB tech layer RC.");
+        }
       }
     }
   }
-  logger_->report(
-      "[DEBUG] Wire RC from OpenROAD: R={:.4e} ohm/um, C={:.4e} fF/um",
-      wire_r_per_um_, wire_c_per_um_);
+
+  // Fallback: read from DB tech layer(s) directly.
+  // NOTE: this path reads the RC values written by set_dblayer_wire_rc, which
+  // are also contaminated by the kohm unit conversion.  Use only as last resort.
+  if (wire_r_per_um_ == 0.0 && wire_c_per_um_ == 0.0) {
+    odb::dbTech* tech = db_->getTech();
+    odb::dbBlock* block = db_->getChip() ? db_->getChip()->getBlock() : nullptr;
+    if (tech && block) {
+      std::vector<odb::dbTechLayer*> signal_layers
+          = estimate_parasitics_ ? estimate_parasitics_->signalLayers()
+                                 : std::vector<odb::dbTechLayer*>();
+      if (!signal_layers.empty()) {
+        for (odb::dbTechLayer* layer : signal_layers) {
+          if (!layer || layer->getType() != odb::dbTechLayerType::ROUTING)
+            continue;
+          const float layer_width_um
+              = block->dbuToMicrons(static_cast<int>(layer->getWidth()));
+          if (layer_width_um <= 0.0f)
+            continue;
+          const float r_per_sq   = layer->getResistance();           // ohm/sq
+          const float cap_per_sq  = layer->getCapacitance();          // F/um²
+          const float cap_edge    = layer->getEdgeCapacitance();      // F/um
+          wire_r_per_um_ = r_per_sq / layer_width_um;                 // ohm/um
+          const float c_per_um = layer_width_um * cap_per_sq
+                                 + 2.0f * cap_edge;                   // F/um
+          wire_c_per_um_ = c_per_um * 1e15f;                         // fF/um
+          if (wire_r_per_um_ > 0.0f && wire_c_per_um_ > 0.0f) {
+            logger_->report(
+                "[DEBUG] Wire RC from layer \"{}\" (DB, fallback): "
+                "R={:.4e} ohm/um, C={:.4e} fF/um",
+                layer->getConstName(), wire_r_per_um_, wire_c_per_um_);
+            break;
+          }
+        }
+      }
+
+      // Last resort: average over all routing layers
+      if (wire_r_per_um_ == 0.0 && wire_c_per_um_ == 0.0) {
+        int routing_layer_count = tech->getRoutingLayerCount();
+        int n_layers = 0;
+        double sum_r = 0.0;
+        double sum_c = 0.0;
+        for (int i = 1; i <= routing_layer_count; i++) {
+          odb::dbTechLayer* layer = tech->findRoutingLayer(i);
+          if (!layer || layer->getType() != odb::dbTechLayerType::ROUTING)
+            continue;
+          const float layer_width_um
+              = block->dbuToMicrons(static_cast<int>(layer->getWidth()));
+          if (layer_width_um <= 0.0f)
+            continue;
+          const float r_per_sq   = layer->getResistance();
+          const float cap_per_sq  = layer->getCapacitance();
+          const float cap_edge    = layer->getEdgeCapacitance();
+          const float c_per_um = layer_width_um * cap_per_sq + 2.0f * cap_edge;
+          sum_r += (r_per_sq / layer_width_um);
+          sum_c += (c_per_um * 1e15f);
+          n_layers++;
+        }
+        if (n_layers > 0) {
+          wire_r_per_um_ = sum_r / n_layers;
+          wire_c_per_um_ = sum_c / n_layers;
+          logger_->report(
+              "[DEBUG] Wire RC from DB tech ({} layer avg, fallback): "
+              "R={:.4e} ohm/um, C={:.4e} fF/um",
+              n_layers, wire_r_per_um_, wire_c_per_um_);
+        }
+      }
+    }
+  }
+
+  if (wire_r_per_um_ == 0.0 || wire_c_per_um_ == 0.0) {
+    logger_->warn(RMP, 99,
+        "Wire RC is zero! R={:.4e} ohm/um, C={:.4e} fF/um. "
+        "ABC will use fallback WireDelay coefficient. "
+        "Ensure set_wire_rc or set_layer_rc was called before restructure.",
+        wire_r_per_um_, wire_c_per_um_);
+  }
 
   sta::PinSet ends(open_sta_->getDbNetwork());
 
@@ -578,14 +667,16 @@ void Restructure::runABC()
   Blif blif_(
       logger_, open_sta_, locell_, loport_, hicell_, hiport_, ++blif_call_id_);
   blif_.setReplaceableInstances(path_insts_);
+
+  // Write net coordinates BEFORE writeBlif, because writeBlif disconnects iterms
+  logger_->report("[DBG] Calling writeNetCoordinates, path_insts_ size: {}", path_insts_.size());
+  writeNetCoordinates(coord_file_name_);
+  logger_->report("[DBG] Done writeNetCoordinates");
+
   blif_.writeBlif(input_blif_file_name_.c_str(), !is_area_mode_);
   debugPrint(
       logger_, RMP, "remap", 1, "Writing blif file {}", input_blif_file_name_);
   files_to_remove.emplace_back(input_blif_file_name_);
-
-  // Write net coordinates (net_name -> output_pin_position) for ABC wire-aware mapping
-  writeNetCoordinates(coord_file_name_);
-  files_to_remove.emplace_back(coord_file_name_);
 
   // abc optimization
   std::vector<Mode> modes;
@@ -603,7 +694,6 @@ void Restructure::runABC()
 
   std::string best_blif;
   int best_inst_count = std::numeric_limits<int>::max();
-  float best_delay_gain = std::numeric_limits<float>::max();
 
   debugPrint(
       logger_, RMP, "remap", 1, "Running ABC with {} modes.", modes.size());
@@ -611,12 +701,12 @@ void Restructure::runABC()
   for (size_t curr_mode_idx = 0; curr_mode_idx < modes.size();
        curr_mode_idx++) {
     output_blif_file_name_
-        = prefix + std::to_string(curr_mode_idx) + "_crit_path_out.blif";
+        = prefix + "_" + std::to_string(curr_mode_idx) + "_crit_path_out.blif";
 
     opt_mode_ = modes[curr_mode_idx];
 
     const std::string abc_script_file
-        = prefix + std::to_string(curr_mode_idx) + "ord_abc_script.tcl";
+        = prefix + "_" + std::to_string(curr_mode_idx) + "_ord_abc_script.tcl";
     if (logfile_.empty()) {
       logfile_ = prefix + "abc.log";
     }
@@ -628,7 +718,23 @@ void Restructure::runABC()
                "Writing ABC script file {}.",
                abc_script_file);
 
+    logger_->report("[DBG] ABC script file: {}", abc_script_file);
+    {
+      std::ifstream sf(abc_script_file.c_str());
+      if (sf.good()) {
+        std::string line;
+        logger_->report("[DBG] ABC script content:");
+        while (std::getline(sf, line) && line.size() < 200) {
+          logger_->report("  {}", line);
+        }
+      } else {
+        logger_->report("[DBG] ABC script file NOT found!");
+      }
+    }
+
+    logger_->report("[DBG] Calling writeAbcScript: {}", abc_script_file);
     if (writeAbcScript(abc_script_file)) {
+      logger_->report("[DBG] writeAbcScript succeeded");
       // call linked abc
       Abc_Start();
       Abc_Frame_t* abc_frame = Abc_FrameGetGlobalFrame();
@@ -642,7 +748,8 @@ void Restructure::runABC()
       child_proc[curr_mode_idx]
           = Cmd_CommandExecute(abc_frame, command.c_str());
       if (child_proc[curr_mode_idx]) {
-        logger_->error(RMP, 6, "Error executing ABC command {}.", command);
+        logger_->error(RMP, 6, "Error executing ABC command {}. Return code: {}.",
+                       command, child_proc[curr_mode_idx]);
         return;
       }
       Abc_Stop();
@@ -659,46 +766,59 @@ void Restructure::runABC()
     }
 
     output_blif_file_name_
-        = prefix + std::to_string(curr_mode_idx) + "_crit_path_out.blif";
-    const std::string abc_log_name = logfile_ + std::to_string(curr_mode_idx);
+        = prefix + "_" + std::to_string(curr_mode_idx) + "_crit_path_out.blif";
+    const std::string abc_log_name = logfile_;  // ABC always writes to logfile_ (no suffix)
+    logger_->report("[DBG] Checking ABC output BLIF: {}", output_blif_file_name_);
+    {
+      std::ifstream test_f(output_blif_file_name_.c_str());
+      if (test_f.good()) {
+        test_f.seekg(0, std::ios::end);
+        long long fsize = test_f.tellg();
+        logger_->report("[DBG]   File size: {} bytes", fsize);
+      } else {
+        logger_->report("[DBG]   File does NOT exist or cannot be opened!");
+      }
+    }
 
     int level_gain = 0;
     float delay = std::numeric_limits<float>::max();
     int num_instances = 0;
-    bool success = readAbcLog(abc_log_name, level_gain, delay);
-    if (success) {
-      success
-          = blif_.inspectBlif(output_blif_file_name_.c_str(), num_instances);
-      logger_->report(
-          "Optimized to {} instances in iteration {} with max path depth "
-          "decrease of {}, delay of {}.",
-          num_instances,
-          curr_mode_idx,
-          level_gain,
-          delay);
+    readAbcLog(abc_log_name, level_gain, delay);
 
-      if (success) {
-        if (is_area_mode_) {
-          if (num_instances < best_inst_count) {
-            best_inst_count = num_instances;
-            best_blif = output_blif_file_name_;
-          }
-        } else {
-          // Using only DELAY_4 for delay based gain since other modes not
-          // showing good gains
-          if (modes[curr_mode_idx] == Mode::DELAY_4) {
-            best_delay_gain = delay;
-            best_blif = output_blif_file_name_;
-          }
+    bool blif_ok = blif_.inspectBlif(output_blif_file_name_.c_str(), num_instances);
+    logger_->report(
+        "Optimized to {} instances in iteration {} with max path depth "
+        "decrease of {}, delay of {}.",
+        num_instances,
+        curr_mode_idx,
+        level_gain,
+        delay);
+
+    if (blif_ok && num_instances > 0) {
+      if (is_area_mode_) {
+        if (num_instances < best_inst_count) {
+          best_inst_count = num_instances;
+          best_blif = output_blif_file_name_;
+        }
+      } else {
+        // Using only DELAY_4 for delay based gain since other modes not
+        // showing good gains
+        if (modes[curr_mode_idx] == Mode::DELAY_4) {
+          best_blif = output_blif_file_name_;
         }
       }
     }
+
     files_to_remove.emplace_back(output_blif_file_name_);
   }
 
-  if (best_inst_count < std::numeric_limits<int>::max()
-      || best_delay_gain < std::numeric_limits<float>::max()) {
-    // read back netlist
+  // Apply best result when we actually picked an output BLIF.
+  //
+  // Bug fix (timing mode): the old condition used best_delay_gain < FLT_MAX,
+  // but readAbcLog() often leaves delay at FLT_MAX when the log has no
+  // "delay = ..." line. DELAY_4 could still set best_blif after inspectBlif()
+  // succeeded; we must not skip readBlif in that case.
+  if (!best_blif.empty()) {
     debugPrint(logger_, RMP, "remap", 1, "Reading blif file {}.", best_blif);
     blif_.readBlif(best_blif.c_str(), block_);
     debugPrint(logger_,
@@ -1028,6 +1148,8 @@ bool Restructure::writeAbcScript(const std::string& file_name)
     logger_->error(RMP, 3, "Cannot open file {} for writing.", file_name);
     return false;
   }
+  
+  logger_->report("[DBG] writeAbcScript: file opened successfully");
 
   for (const auto& lib_name : lib_file_names_) {
     // abc read_lib prints verbose by default, -v toggles to off to avoid read
@@ -1050,8 +1172,9 @@ bool Restructure::writeAbcScript(const std::string& file_name)
   // Read coordinates for wire-aware mapping (sets pAbc->pNtkCoords and wire RC)
   script << "read_coords " << coord_file_name_ << '\n';
 
-  // Use if command with wire-aware mapping (-W flag)
-  // WireDelayFactor 0.001 = 1nm per unit wirelength (scaled)
+  // Use if (LUT-based mapping) with wire-aware delay (-W 0.001).
+  // if outputs LUTs by default, but write_blif maps them to std cells.
+  // -W 0.001: wire-aware mapping with Elmore wire delay model.
   script << "if -W 0.001\n";
 
   script << "write_blif " << output_blif_file_name_ << '\n';
@@ -1194,17 +1317,31 @@ void Restructure::writeNetCoordinates(const std::string& file_name)
   std::set<odb::dbNet*> cone_nets;
 
   for (auto inst : path_insts_) {
+    int iterm_count = 0;
+    int iterm_connected = 0;
+    int iterm_with_net = 0;
     for (odb::dbITerm* iterm : inst->getITerms()) {
-      if (!iterm->isConnected())
+      iterm_count++;
+      odb::dbNet* net = iterm->getNet();
+      if (!net) {
         continue;
+      }
+      iterm_connected++;
       if (iterm->getSigType() == odb::dbSigType::POWER
           || iterm->getSigType() == odb::dbSigType::GROUND)
         continue;
-      odb::dbNet* net = iterm->getNet();
-      if (net)
+      if (net) {
         cone_nets.insert(net);
+        iterm_with_net++;
+      }
+    }
+    if (iterm_count == 0) {
+      logger_->report("[DBG] Instance {} has 0 iterms", inst->getName());
+    } else if (iterm_connected == 0) {
+      logger_->report("[DBG] Instance {} has {} iterms, 0 connected", inst->getName(), iterm_count);
     }
   }
+  logger_->report("[DBG] After loop: cone_nets={}", cone_nets.size());
 
   std::map<std::string, std::pair<double, double>> net_coords;
   int nets_with_position = 0;
@@ -1247,7 +1384,7 @@ void Restructure::writeNetCoordinates(const std::string& file_name)
       cone_nets.size(), nets_with_position, nets_without_position);
 
   coord_file << "# Net-to-output-pin coordinates for ABC wire-aware mapping\n";
-  coord_file << "# wire_rc " << std::scientific << wire_r_per_um_ << " " << wire_c_per_um_ << "\n";
+  coord_file << "#wire_rc " << std::scientific << wire_r_per_um_ << " " << wire_c_per_um_ << "\n";
   coord_file << "# Format: net_name x(um) y(um)\n";
   coord_file << net_coords.size() << "\n";
 
