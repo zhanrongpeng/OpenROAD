@@ -1165,19 +1165,23 @@ bool Restructure::writeAbcScript(const std::string& file_name)
            << '\n';
   }
 
-  // Physical-aware mapping: skip rewrite/refactor
-  // Wire RC is set directly via Abc_FrameSetWireRC() in C++ before sourcing this script
-  script << "strash\n";
-
-  // Read coordinates for wire-aware mapping (sets pAbc->pNtkCoords and wire RC)
+  // Physical-aware mapping flow:
+  // 1. read_coords: load net-name -> (x,y) mapping from coords file
+  // 2. strash: convert blif to AIG (net names are preserved during strash)
+  // 3. propagate_coords: propagate coordinates through the AIG structure
+  // 4. map -W: wire-aware standard-cell mapping (uses propagated coordinates)
+  //
+  // Wire RC is set directly via Abc_FrameSetWireRC() in C++ before sourcing
+  // this script, so we do NOT repeat it in the coords file.
   script << "read_coords " << coord_file_name_ << '\n';
+  script << "strash\n";
+  script << "propagate_coords\n";
 
-  // Use if (LUT mapping) with wire-aware delay optimization (-W flag).
-  // if outputs LUTs for area/speed optimization, while map outputs standard cells.
-  // -W 0.001: wire-aware delay threshold (0.001 delay units), ABC computes
-  //   wire delay from coordinates (loaded by read_coords) and wire RC (set by
-  //   Abc_FrameSetWireRC from OpenROAD) using Elmore delay model.
-  script << "if -W 0.001\n";
+  // map outputs standard cells (not LUTs like the 'if' command).
+  // -D 0.01: delay-driven SC mapping.
+  // -W: wire-aware mapping flag (RC set by Abc_FrameSetWireRC from OpenROAD,
+  //     coordinates propagated by propagate_coords above).
+  script << "map -D 0.01 -W\n";
 
   script << "write_blif " << output_blif_file_name_ << '\n';
 
