@@ -1172,12 +1172,15 @@ bool Restructure::writeAbcScript(const std::string& file_name)
   // Read coordinates for wire-aware mapping (sets pAbc->pNtkCoords and wire RC)
   script << "read_coords " << coord_file_name_ << '\n';
 
-  // Use map with wire-aware mapping (-W flag).
-  // map outputs .gate (standard cells) instead of LUTs (if command).
-  // -D 0.01: delay-driven SC mapping.
-  // -W: wire-aware mapping flag (RC set by Abc_FrameSetWireRC from OpenROAD,
-  //     coordinates loaded by read_coords command before 'map').
-  script << "map -D 0.01 -W\n";
+  // Use if with wire-aware mapping (-W 0.001).
+  // if (FPGA mapper) outputs LUTs using cut-based evaluation with tdelay from SCL library.
+  // -W 0.001: wire delay coefficient = R(ohm/um) * C(fF/um) * 0.5e-3.
+  //   Combined cut delay = tdelay(cut) + WireDelay_coef * wirelength_um.
+  //   Wirelength is Manhattan distance from leaf centroid to fanin.
+  // NOTE: map -D 0.01 -W has a bug where -W is parsed as WireDelay argument (needs value after -W),
+  //   causing WireDelay=0 and disabling wire-aware entirely. if -W 0.001 works correctly
+  //   and has well-tested coordinate lookup via vNodeNameMap + vNodeDrivingPoName.
+  script << "if -W 0.001\n";
 
   script << "write_blif " << output_blif_file_name_ << '\n';
 
