@@ -1172,9 +1172,11 @@ bool Restructure::writeAbcScript(const std::string& file_name)
   // Read coordinates for wire-aware mapping (sets pAbc->pNtkCoords and wire RC)
   script << "read_coords " << coord_file_name_ << '\n';
 
-  // Use if (LUT-based mapping) with wire-aware delay (-W 0.001).
-  // if outputs LUTs by default, but write_blif maps them to std cells.
-  // -W 0.001: wire-aware mapping with Elmore wire delay model.
+  // Use if (LUT mapping) with wire-aware delay optimization (-W flag).
+  // if outputs LUTs for area/speed optimization, while map outputs standard cells.
+  // -W 0.001: wire-aware delay threshold (0.001 delay units), ABC computes
+  //   wire delay from coordinates (loaded by read_coords) and wire RC (set by
+  //   Abc_FrameSetWireRC from OpenROAD) using Elmore delay model.
   script << "if -W 0.001\n";
 
   script << "write_blif " << output_blif_file_name_ << '\n';
