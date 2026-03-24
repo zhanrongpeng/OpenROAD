@@ -1165,29 +1165,19 @@ bool Restructure::writeAbcScript(const std::string& file_name)
            << '\n';
   }
 
-  // Physical-aware mapping flow:
-  // 1. read_coords: load net-name -> (x,y) mapping from coords file
-  // 2. strash: convert blif to AIG (net names are preserved during strash)
-  // 3. propagate_coords: (optional, for clarity — ABC map/if handle propagation internally)
-  // 4. if -W 0.001: wire-aware LUT mapping with very low delay target (0.001 ns)
-  //
-  // NOTE: We use 'if -W 0.001' instead of 'map -W' because:
-  //   - if uses vNodeNameMap[LeafId] -> blif node name -> Io_ReadCoordsGetCoordByName
-  //     which directly maps blif node names to coordinates from the coords file
-  //   - map uses vNodeDrivingPoName[NodeId] -> PO name -> Io_ReadCoordsGetCoordByName
-  //     which traces back through PO names to find net names
-  //   - In practice, 'if -W' was verified to work correctly in prior tests (0 instances
-  //     issue resolved), while 'map -W' caused 0 instances in the output BLIF
-  //
-  // Wire RC is set directly via Abc_FrameSetWireRC() in C++ before sourcing
-  // this script, so we do NOT repeat it in the coords file.
-  script << "read_coords " << coord_file_name_ << '\n';
+  // Physical-aware mapping: skip rewrite/refactor
+  // Wire RC is set directly via Abc_FrameSetWireRC() in C++ before sourcing this script
   script << "strash\n";
-  script << "propagate_coords\n";
 
-  // if outputs LUTs from the library with wire-aware delay.
-  // WireDelay is in ns/um (0.001 ns/um ≈ 1ps/um, realistic for local wires).
-  script << "if -W 0.001\n";
+  // Read coordinates for wire-aware mapping (sets pAbc->pNtkCoords and wire RC)
+  script << "read_coords " << coord_file_name_ << '\n';
+
+  // Use map with wire-aware mapping (-W flag).
+  // map outputs .gate (standard cells) instead of LUTs (if command).
+  // -D 0.01: delay-driven SC mapping.
+  // -W: wire-aware mapping flag (RC set by Abc_FrameSetWireRC from OpenROAD,
+  //     coordinates loaded by read_coords command before 'map').
+  script << "map -D 0.01 -W\n";
 
   script << "write_blif " << output_blif_file_name_ << '\n';
 
