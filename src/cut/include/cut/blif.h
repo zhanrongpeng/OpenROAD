@@ -43,6 +43,8 @@ class Blif
   float getArrivalTime(sta::Pin* term, bool is_rise);
   void addArrival(sta::Pin* pin, const std::string& netName);
   void addRequired(sta::Pin* pin, const std::string& netName);
+  const std::map<std::string, std::pair<float, float>>& getArrivals() const { return arrivals_; }
+  const std::map<std::string, std::pair<float, float>>& getRequireds() const { return requireds_; }
 
  private:
   std::set<odb::dbInst*> instances_to_optimize_;

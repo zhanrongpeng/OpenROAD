@@ -24,11 +24,30 @@
 #include <queue>
 
 #include "annealing_strategy.h"
+
+// Follow the same include order as abc_library_factory.cpp so that:
+// 1. st.h opens namespace abc { (via abc_global.h)
+// 2. utilNam.h adds Abc_Nam_t to abc::
+// 3. sclCon.h uses Abc_Nam_t (already in abc::)
+// clang-format off
+#include "misc/st/st.h"
+#include "map/mio/mio.h"
+#include "misc/util/utilNam.h"
+#include "map/scl/sclCon.h"
+// clang-format on
+
 #include "base/abc/abc.h"
 #include "base/main/abcapis.h"
 #include "cut/abc_init.h"
 #include "cut/abc_library_factory.h"
 #include "cut/blif.h"
+
+// Abc_FrameReadNtk is in main.h (not in abc.h or abcapis.h). Declare it manually.
+// mainInt.h has the full Abc_Frame_t_ struct definition (needed to access pAbcCon).
+ABC_NAMESPACE_HEADER_START
+extern ABC_DLL Abc_Ntk_t* Abc_FrameReadNtk(Abc_Frame_t* p);
+ABC_NAMESPACE_HEADER_END
+#include "base/main/mainInt.h"
 #include "db_sta/dbNetwork.hh"
 #include "db_sta/dbSta.hh"
 #include "odb/db.h"
@@ -52,6 +71,12 @@
 #include "utl/Logger.h"
 #include "zero_slack_strategy.h"
 
+// Abc_NtkNameMan is defined in abcNames.c but not declared in abc.h.
+// Declare it here so Restructure.cpp can call it.
+ABC_NAMESPACE_HEADER_START
+extern ABC_DLL Abc_Nam_t* Abc_NtkNameMan(Abc_Ntk_t* p, int fOuts);
+ABC_NAMESPACE_HEADER_END
+
 namespace rmp {
 
 using abc::Abc_Frame_t;
@@ -59,6 +84,22 @@ using abc::Abc_FrameGetGlobalFrame;
 using abc::Abc_Start;
 using abc::Abc_Stop;
 using abc::Abc_FrameSetWireRC;
+using abc::Abc_Ntk_t;
+using abc::Abc_Obj_t;
+using abc::Abc_FrameReadNtk;
+using abc::Abc_NtkCollectCioNames;
+using abc::Abc_NtkNameMan;
+using abc::Abc_NtkCi;
+using abc::Abc_NtkCo;
+using abc::Abc_NtkCiNum;
+using abc::Abc_NtkCoNum;
+using abc::Abc_ObjFanin0;
+using abc::Abc_ObjFanout0;
+using abc::Abc_ObjFanoutNum;
+using abc::Abc_ObjName;
+using abc::Abc_ObjId;
+using abc::Abc_NtkTimeSetArrival;
+using abc::Abc_NtkTimeSetRequired;
 using cut::Blif;
 using utl::RMP;
 
@@ -657,142 +698,161 @@ void Restructure::runABC()
   coord_file_name_ = prefix + "_coords.txt";
   std::vector<std::string> files_to_remove;
 
-  debugPrint(logger_,
-             utl::RMP,
-             "remap",
-             1,
-             "Constants before remap {}",
-             countConsts(block_));
+  debugPrint(logger_, utl::RMP, "remap", 1,
+             "Constants before remap {}", countConsts(block_));
 
   Blif blif_(
       logger_, open_sta_, locell_, loport_, hicell_, hiport_, ++blif_call_id_);
   blif_.setReplaceableInstances(path_insts_);
 
-  // Write net coordinates BEFORE writeBlif, because writeBlif disconnects iterms
-  logger_->report("[DBG] Calling writeNetCoordinates, path_insts_ size: {}", path_insts_.size());
   writeNetCoordinates(coord_file_name_);
-  logger_->report("[DBG] Done writeNetCoordinates");
-
   blif_.writeBlif(input_blif_file_name_.c_str(), !is_area_mode_);
-  debugPrint(
-      logger_, RMP, "remap", 1, "Writing blif file {}", input_blif_file_name_);
+  debugPrint(logger_, RMP, "remap", 1,
+             "Writing blif file {}", input_blif_file_name_);
   files_to_remove.emplace_back(input_blif_file_name_);
 
-  // abc optimization
-  std::vector<Mode> modes;
-  std::vector<pid_t> child_proc;
-
-  if (is_area_mode_) {
-    // Area Mode
-    modes = {Mode::AREA_1, Mode::AREA_2, Mode::AREA_3};
-  } else {
-    // Delay Mode
-    modes = {Mode::DELAY_1, Mode::DELAY_2, Mode::DELAY_3, Mode::DELAY_4};
+  // ── Capture boundary timing from blif_ BEFORE writeBlif destroys path_insts_ ──
+  // writeBlif populates arrivals_ (PI/CI) and requireds_ (PO/CO) maps using the
+  // net names as they appear in the BLIF file (net->getName()).
+  // After strash in ABC, ABC PI/CO names match these BLIF net names 1-to-1.
+  if (!is_area_mode_) {
+    or_timing_.clear();
+    for (const auto& [net_name, arr_pair] : blif_.getArrivals()) {
+      // store as {arrival_ns, 0.0}. value is in ps (blif stores ps), convert to ns.
+      double arr_ns = arr_pair.first * 1e-3;  // ps → ns
+      or_timing_[net_name] = {arr_ns, 0.0};
+    }
+    for (const auto& [net_name, req_pair] : blif_.getRequireds()) {
+      double req_ns = req_pair.first * 1e-3;  // ps → ns
+      or_timing_[net_name] = {0.0, req_ns};
+    }
+    logger_->report("[INFO RMP-TDLY] Captured {} arrivals, {} requireds from blif_ (timing mode)",
+                    blif_.getArrivals().size(), blif_.getRequireds().size());
   }
 
-  child_proc.resize(modes.size(), 0);
+  // ── Pre-compute timing for cone boundary nets AFTER writeBlif (for wire delay). ──
+  // Extract CI/CO names from the BLIF file so injectTimingToAbc can match them.
+  precomputeBoundaryTimingForBlif(input_blif_file_name_);
 
+  std::vector<Mode> modes;
+  if (is_area_mode_) {
+    modes = {Mode::AREA_1, Mode::AREA_2, Mode::AREA_3};
+  } else {
+    modes = {Mode::DELAY_1, Mode::DELAY_2, Mode::DELAY_3, Mode::DELAY_4};
+  }
+  std::vector<pid_t> child_proc(modes.size(), 0);
+
+  if (logfile_.empty()) {
+    logfile_ = prefix + "abc.log";
+  }
+
+  debugPrint(logger_, RMP, "remap", 1,
+             "Running ABC with {} modes.", modes.size());
+
+  // ── Start ABC framework ─────────────────────────────────────────────────────
+  Abc_Start();
+  abc::Abc_Frame_t* abc_frame = abc::Abc_FrameGetGlobalFrame();
+
+  // Set wire RC from OpenROAD (used by ABC's wire-aware mapper)
+  abc::Abc_FrameSetWireRC(
+      static_cast<float>(wire_r_per_um_),
+      static_cast<float>(wire_c_per_um_));
+
+  // ── Run each mode ──────────────────────────────────────────────────────────
+  for (size_t curr_mode_idx = 0; curr_mode_idx < modes.size(); curr_mode_idx++) {
+    output_blif_file_name_
+        = prefix + "_" + std::to_string(curr_mode_idx) + "_crit_path_out.blif";
+    opt_mode_ = modes[curr_mode_idx];
+
+    std::string abc_script_file
+        = prefix + "_" + std::to_string(curr_mode_idx) + "_ord_abc_script.tcl";
+
+    if (is_area_mode_) {
+      // ── Area mode: use writeAbcScript (simple map -D -W) ─────────────────
+      writeAbcScript(abc_script_file);
+      child_proc[curr_mode_idx] = abc::Cmd_CommandExecute(
+          abc_frame, ("source " + abc_script_file).c_str());
+      if (child_proc[curr_mode_idx]) {
+        logger_->error(RMP, 18, "ABC command failed with code {}.",
+                       child_proc[curr_mode_idx]);
+        Abc_Stop();
+        return;
+      }
+      files_to_remove.emplace_back(abc_script_file);
+    } else {
+      // ── Timing mode: inject tdelay between strash+read_coords and map ──────
+      //
+      // Step 1: write & source the SETUP script (read_lib + read_blif + strash + read_coords)
+      std::string setup_file = abc_script_file + ".setup.tcl";
+      writeAbcScriptSetup(setup_file);
+      child_proc[curr_mode_idx] = abc::Cmd_CommandExecute(
+          abc_frame, ("source " + setup_file).c_str());
+      if (child_proc[curr_mode_idx]) {
+        logger_->error(RMP, 16, "ABC setup command failed with code {}.",
+                       child_proc[curr_mode_idx]);
+        Abc_Stop();
+        return;
+      }
+      files_to_remove.emplace_back(setup_file);
+
+      // Step 2: inject tdelay via C++ API (must happen after strash, before map)
+      // tdelay = cell_delay (vertex arrival time from OpenROAD STA) +
+      //          wire_delay (Elmore: R * C * L_worst^2 * 0.5 * 1e-3)
+      injectTimingToAbc(static_cast<void*>(abc_frame));
+
+      // Step 3: execute map (timing-driven + wire-aware).
+      // This is a SINGLE map command with delay target and wire-aware flags.
+      // No logic restructuring (no resyn2/choice2/fraigs).
+      // Cell delay is from tdelay we injected above.
+      // Wire delay is from read_coords + Abc_FrameSetWireRC.
+      std::string map_only_file = abc_script_file + ".maponly.tcl";
+      {
+        std::ofstream mf(map_only_file.c_str());
+        mf << "map -D 0.1 -W\n";
+        mf.close();
+      }
+      child_proc[curr_mode_idx] = abc::Cmd_CommandExecute(
+          abc_frame, ("source " + map_only_file).c_str());
+      files_to_remove.emplace_back(map_only_file);
+      if (child_proc[curr_mode_idx]) {
+        logger_->error(RMP, 17, "ABC map command failed with code {}.",
+                       child_proc[curr_mode_idx]);
+        Abc_Stop();
+        return;
+      }
+    }
+
+    // Write output blif
+    abc::Cmd_CommandExecute(
+        abc_frame,
+        ("write_blif " + output_blif_file_name_).c_str());
+    files_to_remove.emplace_back(output_blif_file_name_);
+  }
+
+  // ── Stop ABC framework ────────────────────────────────────────────────────
+  Abc_Stop();
+
+  // ── Inspect results and pick the best ───────────────────────────────────
   std::string best_blif;
   int best_inst_count = std::numeric_limits<int>::max();
 
-  debugPrint(
-      logger_, RMP, "remap", 1, "Running ABC with {} modes.", modes.size());
-
-  for (size_t curr_mode_idx = 0; curr_mode_idx < modes.size();
-       curr_mode_idx++) {
-    output_blif_file_name_
-        = prefix + "_" + std::to_string(curr_mode_idx) + "_crit_path_out.blif";
-
-    opt_mode_ = modes[curr_mode_idx];
-
-    const std::string abc_script_file
-        = prefix + "_" + std::to_string(curr_mode_idx) + "_ord_abc_script.tcl";
-    if (logfile_.empty()) {
-      logfile_ = prefix + "abc.log";
-    }
-
-    debugPrint(logger_,
-               RMP,
-               "remap",
-               1,
-               "Writing ABC script file {}.",
-               abc_script_file);
-
-    logger_->report("[DBG] ABC script file: {}", abc_script_file);
-    {
-      std::ifstream sf(abc_script_file.c_str());
-      if (sf.good()) {
-        std::string line;
-        logger_->report("[DBG] ABC script content:");
-        while (std::getline(sf, line) && line.size() < 200) {
-          logger_->report("  {}", line);
-        }
-      } else {
-        logger_->report("[DBG] ABC script file NOT found!");
-      }
-    }
-
-    logger_->report("[DBG] Calling writeAbcScript: {}", abc_script_file);
-    if (writeAbcScript(abc_script_file)) {
-      logger_->report("[DBG] writeAbcScript succeeded");
-      // call linked abc
-      Abc_Start();
-      Abc_Frame_t* abc_frame = Abc_FrameGetGlobalFrame();
-
-      // Set wire RC from OpenROAD directly (bypass coords file)
-      Abc_FrameSetWireRC(
-          static_cast<float>(wire_r_per_um_),
-          static_cast<float>(wire_c_per_um_));
-
-      const std::string command = "source " + abc_script_file;
-      child_proc[curr_mode_idx]
-          = Cmd_CommandExecute(abc_frame, command.c_str());
-      if (child_proc[curr_mode_idx]) {
-        logger_->error(RMP, 6, "Error executing ABC command {}. Return code: {}.",
-                       command, child_proc[curr_mode_idx]);
-        return;
-      }
-      Abc_Stop();
-      // exit linked abc
-      files_to_remove.emplace_back(abc_script_file);
-    }
-  }  // end modes
-
-  // Inspect ABC results to choose blif with least instance count
-  for (int curr_mode_idx = 0; curr_mode_idx < modes.size(); curr_mode_idx++) {
-    // Skip failed ABC runs
-    if (child_proc[curr_mode_idx] != 0) {
+  for (size_t curr_mode_idx = 0; curr_mode_idx < modes.size(); curr_mode_idx++) {
+    if (child_proc[curr_mode_idx] != 0)
       continue;
-    }
 
     output_blif_file_name_
         = prefix + "_" + std::to_string(curr_mode_idx) + "_crit_path_out.blif";
-    const std::string abc_log_name = logfile_;  // ABC always writes to logfile_ (no suffix)
-    logger_->report("[DBG] Checking ABC output BLIF: {}", output_blif_file_name_);
-    {
-      std::ifstream test_f(output_blif_file_name_.c_str());
-      if (test_f.good()) {
-        test_f.seekg(0, std::ios::end);
-        long long fsize = test_f.tellg();
-        logger_->report("[DBG]   File size: {} bytes", fsize);
-      } else {
-        logger_->report("[DBG]   File does NOT exist or cannot be opened!");
-      }
-    }
 
     int level_gain = 0;
     float delay = std::numeric_limits<float>::max();
     int num_instances = 0;
-    readAbcLog(abc_log_name, level_gain, delay);
+    readAbcLog(logfile_, level_gain, delay);
 
     bool blif_ok = blif_.inspectBlif(output_blif_file_name_.c_str(), num_instances);
     logger_->report(
         "Optimized to {} instances in iteration {} with max path depth "
         "decrease of {}, delay of {}.",
-        num_instances,
-        curr_mode_idx,
-        level_gain,
-        delay);
+        num_instances, curr_mode_idx, level_gain, delay);
 
     if (blif_ok && num_instances > 0) {
       if (is_area_mode_) {
@@ -801,44 +861,26 @@ void Restructure::runABC()
           best_blif = output_blif_file_name_;
         }
       } else {
-        // Using only DELAY_4 for delay based gain since other modes not
-        // showing good gains
         if (modes[curr_mode_idx] == Mode::DELAY_4) {
           best_blif = output_blif_file_name_;
         }
       }
     }
-
-    files_to_remove.emplace_back(output_blif_file_name_);
   }
 
-  // Apply best result when we actually picked an output BLIF.
-  //
-  // Bug fix (timing mode): the old condition used best_delay_gain < FLT_MAX,
-  // but readAbcLog() often leaves delay at FLT_MAX when the log has no
-  // "delay = ..." line. DELAY_4 could still set best_blif after inspectBlif()
-  // succeeded; we must not skip readBlif in that case.
   if (!best_blif.empty()) {
     debugPrint(logger_, RMP, "remap", 1, "Reading blif file {}.", best_blif);
     blif_.readBlif(best_blif.c_str(), block_);
-    debugPrint(logger_,
-               utl::RMP,
-               "remap",
-               1,
-               "Number constants after restructure {}.",
-               countConsts(block_));
+    debugPrint(logger_, RMP, "remap", 1,
+               "Number constants after restructure {}.", countConsts(block_));
   } else {
-    logger_->info(
-        RMP, 13, "All re-synthesis runs discarded, keeping original netlist.");
+    logger_->info(RMP, 13,
+                  "All re-synthesis runs discarded, keeping original netlist.");
   }
 
-  for (const auto& file_to_remove : files_to_remove) {
-    if (!logger_->debugCheck(RMP, "remap", 1)) {
-      std::error_code err;
-      if (std::filesystem::remove(file_to_remove, err); err) {
-        logger_->error(RMP, 11, "Fail to remove file {}", file_to_remove);
-      }
-    }
+  for (const auto& f : files_to_remove) {
+    std::error_code err;
+    std::filesystem::remove(f, err);  // always keep BLIF for debugging
   }
 }
 
@@ -1145,17 +1187,13 @@ bool Restructure::writeAbcScript(const std::string& file_name)
   std::ofstream script(file_name.c_str());
 
   if (!script.is_open()) {
-    logger_->error(RMP, 3, "Cannot open file {} for writing.", file_name);
+    logger_->error(RMP, 20, "Cannot open file {} for writing.", file_name);
     return false;
   }
   
-  logger_->report("[DBG] writeAbcScript: file opened successfully");
-
+  // Physical-aware mapping
   for (const auto& lib_name : lib_file_names_) {
-    // abc read_lib prints verbose by default, -v toggles to off to avoid read
-    // time being printed
-    std::string read_lib_str = "read_lib -v " + lib_name + "\n";
-    script << read_lib_str;
+    script << "read_lib -v " << lib_name << "\n";
   }
 
   script << "read_blif -n " << input_blif_file_name_ << '\n';
@@ -1172,15 +1210,13 @@ bool Restructure::writeAbcScript(const std::string& file_name)
   // Read coordinates for wire-aware mapping (sets pAbc->pNtkCoords and wire RC)
   script << "read_coords " << coord_file_name_ << '\n';
 
-  // Use if with wire-aware mapping (-W 0.001).
-  // if (FPGA mapper) outputs LUTs using cut-based evaluation with tdelay from SCL library.
-  // -W 0.001: wire delay coefficient = R(ohm/um) * C(fF/um) * 0.5e-3.
-  //   Combined cut delay = tdelay(cut) + WireDelay_coef * wirelength_um.
-  //   Wirelength is Manhattan distance from leaf centroid to fanin.
-  // NOTE: map -D 0.01 -W has a bug where -W is parsed as WireDelay argument (needs value after -W),
-  //   causing WireDelay=0 and disabling wire-aware entirely. if -W 0.001 works correctly
-  //   and has well-tested coordinate lookup via vNodeNameMap + vNodeDrivingPoName.
-  script << "if -W 0.001\n";
+  // Use map with wire-aware mapping (-W flag).
+  // map outputs .gate (standard cells) instead of LUTs (if command).
+  // -D 0.1: delay-driven SC mapping (gentler target; 0.01 often triggers
+  //          "Cannot meet the target" and skips delay optimization).
+  // -W: wire-aware mapping flag (RC set by Abc_FrameSetWireRC from OpenROAD,
+  //     coordinates loaded by read_coords command before 'map').
+  script << "map -D 0.1 -W\n";
 
   script << "write_blif " << output_blif_file_name_ << '\n';
 
@@ -1194,8 +1230,172 @@ bool Restructure::writeAbcScript(const std::string& file_name)
   return true;
 }
 
-void Restructure::writeOptCommands(std::ofstream& script)
+// Writes the setup portion of the ABC script for timing mode:
+//   read_lib → read_blif → strash → read_coords
+// The map command is NOT written here — it is executed separately in runABC()
+// after injectTimingToAbc() has written a .constr file and called read_constr.
+void Restructure::writeAbcScriptSetup(const std::string& file_name)
 {
+  std::ofstream script(file_name.c_str());
+  if (!script.is_open()) {
+    logger_->error(RMP, 21, "Cannot open file {} for writing.", file_name);
+    return;
+  }
+
+  for (const auto& lib_name : lib_file_names_) {
+    script << "read_lib -v " << lib_name << "\n";
+  }
+  script << "read_blif -n " << input_blif_file_name_ << '\n';
+  // read_constr will be called here by injectTimingToAbc via C++ API
+  // after it writes the .constr file
+  script << "strash\n";
+  script << "read_coords " << coord_file_name_ << '\n';
+  script.close();
+}
+
+// Inject timing constraints into ABC via direct C API call.
+//
+// or_timing_ was populated in Restructure::run() from blif_.getArrivals() /
+// blif_.getRequireds(). After strash, ABC PI/CO names match BLIF net names 1-to-1.
+//
+// We call Scl_ConRead + Scl_ConUpdateMan directly (via C API) instead of using
+// the ABC 'read_constr' command, because 'read_constr' in this build of ABC routes
+// to the old SDC-like parser (which does not support .input_arrival syntax).
+//
+// SCL constr file format (parsed by Scl_ConRead):
+//   .input_arrival  <pi_name>  <arrival_ns>     (single float value, ns)
+//   .output_required <po_name> <required_ns>      (single float value, ns)
+//   .default_input_arrival <val>
+//   .default_output_required <val>
+void Restructure::injectTimingToAbc(void* abc_frame_ptr)
+{
+  abc::Abc_Frame_t* abc_frame = static_cast<abc::Abc_Frame_t*>(abc_frame_ptr);
+  if (!abc_frame)
+    return;
+
+  abc::Abc_Ntk_t* abc_ntk = abc::Abc_FrameReadNtk(abc_frame);
+  if (!abc_ntk) {
+    logger_->report("[DBG] injectTimingToAbc: no current network in ABC");
+    return;
+  }
+
+  // Get PI/CO names from ABC (after strash).
+  char** pi_names = abc::Abc_NtkCollectCioNames(abc_ntk, 0);
+  char** po_names = abc::Abc_NtkCollectCioNames(abc_ntk, 1);
+  int n_ci = abc::Abc_NtkCiNum(abc_ntk);
+  int n_co = abc::Abc_NtkCoNum(abc_ntk);
+
+  if (!pi_names || n_ci == 0) {
+    logger_->report("[DBG] injectTimingToAbc: no PI names found in ABC network");
+    return;
+  }
+
+  // Build SCL name managers from the ABC network's CI/CO objects.
+  // Scl_ConRead uses these to look up PI/CO indices by name.
+  abc::Abc_Nam_t* pNamI = abc::Abc_NtkNameMan(abc_ntk, 0);  // CI name manager
+  abc::Abc_Nam_t* pNamO = abc::Abc_NtkNameMan(abc_ntk, 1);  // CO name manager
+
+  // Write SCL-format .constr file.
+  std::string constr_file = coord_file_name_ + ".constr";
+  std::ofstream f(constr_file.c_str());
+  if (!f.is_open()) {
+    logger_->report("[DBG] injectTimingToAbc: cannot open {}", constr_file);
+    if (pi_names) ABC_FREE(pi_names);
+    if (po_names) ABC_FREE(po_names);
+    return;
+  }
+
+  // Defaults: PI arrival = 0.0 ns, PO required = 1.8 ns.
+  f << ".default_input_arrival 0.0\n";
+  f << ".default_output_required 1.8\n";
+
+  int n_arr = 0, n_req = 0;
+
+  // PI: write .input_arrival for each PI that has an arrival time.
+  for (int i = 0; i < n_ci; i++) {
+    const char* abc_name = pi_names[i];
+    if (!abc_name || abc_name[0] == '\0')
+      continue;
+    auto it = or_timing_.find(abc_name);
+    if (it != or_timing_.end() && it->second.first > 0.0) {
+      f << ".input_arrival " << abc_name << " " << it->second.first << "\n";
+      n_arr++;
+    }
+  }
+
+  // CO: write .output_required for each CO that has a required time.
+  for (int i = 0; i < n_co; i++) {
+    const char* abc_name = po_names[i];
+    if (!abc_name || abc_name[0] == '\0')
+      continue;
+    auto it = or_timing_.find(abc_name);
+    if (it != or_timing_.end() && it->second.second > 0.0) {
+      f << ".output_required " << abc_name << " " << it->second.second << "\n";
+      n_req++;
+    }
+  }
+
+  f.close();
+
+  // Debug: print first few entries.
+  {
+    std::string dbg;
+    int n = 0;
+    for (const auto& kv : or_timing_) {
+      if (n++ >= 5) break;
+      dbg += " " + kv.first + "=arr:" + std::to_string(kv.second.first)
+           + " req:" + std::to_string(kv.second.second);
+    }
+    logger_->report("[DBG] or_timing_ first entries:{}", dbg);
+  }
+
+  logger_->report("[INFO RMP-TDLY] constr file written: {} ({} arrivals, {} requireds out of {} CI / {} CO)",
+                  constr_file, n_arr, n_req, n_ci, n_co);
+
+  // Scl_ConUpdateMan is a static inline in scl.c, not in any header.
+  // Implement its logic inline: free old manager, install new one.
+  abc::Scl_Con_t* pCon = abc::Scl_ConRead(const_cast<char*>(constr_file.c_str()), pNamI, pNamO);
+  if (abc_frame->pAbcCon) {
+    abc::Scl_ConFree(static_cast<abc::Scl_Con_t*>(abc_frame->pAbcCon));
+  }
+  abc_frame->pAbcCon = pCon;
+  if (pCon) {
+    logger_->report("[INFO RMP-TDLY] SCL constraint manager installed ({} in_arr, {} out_req)",
+                    abc::Scl_ConHasInArrs(), abc::Scl_ConHasOutReqs());
+  } else {
+    logger_->report("[WARN RMP-TDLY] Scl_ConRead returned NULL — constr file not loaded");
+  }
+
+  if (pi_names) ABC_FREE(pi_names);
+  if (po_names) ABC_FREE(po_names);
+}
+
+void Restructure::writeOptCommands(const std::string& file_name)
+{
+  std::ofstream script(file_name.c_str());
+  if (!script.is_open()) {
+    logger_->error(RMP, 19, "Cannot open file {} for writing.", file_name);
+    return;
+  }
+
+  // read_lib + read_blif must come BEFORE strash (ABC needs the network loaded first)
+  for (const auto& lib_name : lib_file_names_) {
+    script << "read_lib -v " << lib_name << "\n";
+  }
+  script << "read_blif -n " << input_blif_file_name_ << '\n';
+
+  if (logger_->debugCheck(RMP, "remap", 1)) {
+    script << "write_verilog " << input_blif_file_name_ + ".v" << '\n';
+  }
+
+  // strash + read_coords MUST come next for wire-aware mapping.
+  // strash converts the network to an AIG (AND-inverter graph).
+  // read_coords loads net physical positions so ABC can compute
+  // wire delays during mapping.  Coordinates are written by
+  // writeNetCoordinates() before ABC is invoked.
+  script << "strash\n";
+  script << "read_coords " << coord_file_name_ << '\n';
+
   std::string choice
       = "alias choice \"fraig_store; resyn2; fraig_store; resyn2; fraig_store; "
         "fraig_restore\"";
@@ -1203,7 +1403,6 @@ void Restructure::writeOptCommands(std::ofstream& script)
       = "alias choice2 \"fraig_store; balance; fraig_store; resyn2; "
         "fraig_store; resyn2; fraig_store; resyn2; fraig_store; "
         "fraig_restore\"";
-  script << "bdd; sop\n";
 
   script << "alias resyn2 \"balance; rewrite; refactor; balance; rewrite; "
             "rewrite -z; balance; refactor -z; rewrite -z; balance\""
@@ -1212,31 +1411,38 @@ void Restructure::writeOptCommands(std::ofstream& script)
   script << choice2 << '\n';
 
   if (opt_mode_ == Mode::AREA_3) {
-    script << "choice2\n";  // << "scleanup" << std::endl;
+    script << "choice2\n";
   } else {
-    script << "resyn2\n";  // << "scleanup" << std::endl;
+    script << "resyn2\n";
   }
 
+  // -W: wire-aware mapping (requires read_coords above; wire RC set by
+  //     Abc_FrameSetWireRC() in C++ before sourcing this script).
+  // -D: target delay in time frames (ABC internal units; 0.01 = 10ps = 10ns*0.01
+  //     if library time scale is ns).  For Nangate45 at typical corner the
+  //     library delay unit is usually 1ns, so 0.01 = 10ps.
+  //     Use a gentler target than -D 0.01 to avoid "Cannot meet the target"
+  //     warnings that cause ABC to skip delay-driven optimization entirely.
   switch (opt_mode_) {
     case Mode::DELAY_1: {
-      script << "map -D 0.01 -A 0.9 -B 0.2 -M 0 -p\n";
+      script << "map -D 0.1 -W -A 0.9 -B 0.2 -M 0 -p\n";
       script << "buffer -p -c\n";
       break;
     }
     case Mode::DELAY_2: {
       script << "choice\n";
-      script << "map -D 0.01 -A 0.9 -B 0.2 -M 0 -p\n";
+      script << "map -D 0.1 -W -A 0.9 -B 0.2 -M 0 -p\n";
       script << "choice\n";
-      script << "map -D 0.01\n";
+      script << "map -D 0.1 -W\n";
       script << "buffer -p -c\n"
              << "topo\n";
       break;
     }
     case Mode::DELAY_3: {
       script << "choice2\n";
-      script << "map -D 0.01 -A 0.9 -B 0.2 -M 0 -p\n";
+      script << "map -D 0.1 -W -A 0.9 -B 0.2 -M 0 -p\n";
       script << "choice2\n";
-      script << "map -D 0.01\n";
+      script << "map -D 0.1 -W\n";
       script << "buffer -p -c\n"
              << "topo\n";
       break;
@@ -1245,7 +1451,7 @@ void Restructure::writeOptCommands(std::ofstream& script)
       script << "choice2\n";
       script << "amap -F 20 -A 20 -C 5000 -Q 0.1 -m\n";
       script << "choice2\n";
-      script << "map -D 0.01 -A 0.9 -B 0.2 -M 0 -p\n";
+      script << "map -D 0.1 -W -A 0.9 -B 0.2 -M 0 -p\n";
       script << "buffer -p -c\n";
       break;
     }
@@ -1264,6 +1470,13 @@ void Restructure::writeOptCommands(std::ofstream& script)
       break;
     }
   }
+
+  script << "write_blif " << output_blif_file_name_ << '\n';
+  if (logger_->debugCheck(RMP, "remap", 1)) {
+    script << "write_verilog " << output_blif_file_name_ + ".v" << '\n';
+  }
+
+  script.close();
 }
 
 void Restructure::setMode(const char* mode_name)
@@ -1341,12 +1554,14 @@ void Restructure::writeNetCoordinates(const std::string& file_name)
       }
     }
     if (iterm_count == 0) {
-      logger_->report("[DBG] Instance {} has 0 iterms", inst->getName());
+      debugPrint(logger_, RMP, "remap", 1,
+                 "Instance {} has 0 iterms", inst->getName());
     } else if (iterm_connected == 0) {
-      logger_->report("[DBG] Instance {} has {} iterms, 0 connected", inst->getName(), iterm_count);
+      debugPrint(logger_, RMP, "remap", 1,
+                 "Instance {} has {} iterms, 0 connected",
+                 inst->getName(), iterm_count);
     }
   }
-  logger_->report("[DBG] After loop: cone_nets={}", cone_nets.size());
 
   std::map<std::string, std::pair<double, double>> net_coords;
   int nets_with_position = 0;
@@ -1369,12 +1584,6 @@ void Restructure::writeNetCoordinates(const std::string& file_name)
     }
 
     if (found) {
-      static int dbg_net = 0;
-      if (dbg_net < 5) {
-        dbg_net++;
-        logger_->report("[DBG] writeNetCoordinates: netName=\"{}\" pin=({},{})",
-            netName, px, py);
-      }
       net_coords[netName] = {
         static_cast<double>(px) / dbu_per_um,
         static_cast<double>(py) / dbu_per_um
@@ -1384,9 +1593,6 @@ void Restructure::writeNetCoordinates(const std::string& file_name)
       nets_without_position++;
     }
   }
-
-  logger_->report("[DBG] writeNetCoordinates: cone_nets={}, with_position={}, without_position={}",
-      cone_nets.size(), nets_with_position, nets_without_position);
 
   coord_file << "# Net-to-output-pin coordinates for ABC wire-aware mapping\n";
   coord_file << "#wire_rc " << std::scientific << wire_r_per_um_ << " " << wire_c_per_um_ << "\n";
@@ -1401,6 +1607,78 @@ void Restructure::writeNetCoordinates(const std::string& file_name)
   debugPrint(logger_, RMP, "remap", 1,
              "Wrote {} net->output_pin coordinates to {} (DBU/um={}, wire RC: R={:.3e} ohm/um, C={:.3e} fF/um)",
              net_coords.size(), file_name, dbu_per_um, wire_r_per_um_, wire_c_per_um_);
+}
+
+std::pair<std::vector<std::string>, std::vector<std::string>>
+Restructure::extractBlifCioNames(const std::string& blif_file)
+{
+  std::vector<std::string> ci_names, co_names;
+  std::ifstream f(blif_file.c_str());
+  if (f.bad()) return {ci_names, co_names};
+
+  std::string line;
+  bool in_inputs = false, in_outputs = false;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+
+    // Check for .inputs/.outputs directives (names may follow on the same line).
+    if (line.rfind(".inputs", 0) == 0) {
+      in_inputs = true; in_outputs = false;
+      std::string rest = line.substr(8);  // skip ".inputs"
+      std::istringstream ss(rest);
+      std::string tok;
+      while (ss >> tok) { if (!tok.empty()) ci_names.push_back(tok); }
+      continue;
+    }
+    if (line.rfind(".outputs", 0) == 0) {
+      in_inputs = false; in_outputs = true;
+      std::string rest = line.substr(9);  // skip ".outputs"
+      std::istringstream ss(rest);
+      std::string tok;
+      while (ss >> tok) { if (!tok.empty()) co_names.push_back(tok); }
+      continue;
+    }
+
+    // .gate, .mlatch, .model, .end: stop collecting.
+    if (line.rfind(".gate", 0) == 0 || line.rfind(".mlatch", 0) == 0
+        || line.rfind(".model", 0) == 0 || line.rfind(".end", 0) == 0) {
+      in_inputs = false; in_outputs = false;
+      continue;
+    }
+    if (line[0] == '.') { in_inputs = false; in_outputs = false; continue; }
+
+    // Continuation of .inputs/.outputs on subsequent lines.
+    if (in_inputs || in_outputs) {
+      std::istringstream ss(line);
+      std::string tok;
+      while (ss >> tok) {
+        if (!tok.empty()) {
+          if (in_inputs) ci_names.push_back(tok);
+          else if (in_outputs) co_names.push_back(tok);
+        }
+      }
+    }
+  }
+  return {ci_names, co_names};
+}
+
+// Extract CI/CO names from the BLIF file (for logging and debugging only).
+// The actual timing in or_timing_ was already populated in Restructure::run()
+// from blif_.getArrivals() / blif_.getRequireds() BEFORE writeBlif destroyed path_insts_.
+//
+// NOTE: do NOT try to look up nets by name via block_->findNet() here.
+// writeBlif calls deleteComponents() which destroys all path_insts_ instances,
+// so block_->findNet() will always fail for internal cone nets.
+//
+// If additional wire-delay-aware timing is needed (e.g. for nets not in arrivals_),
+// it must be computed BEFORE writeBlif.
+void Restructure::precomputeBoundaryTimingForBlif(const std::string& blif_file)
+{
+  // Extract CI/CO names from BLIF for logging.
+  auto [ci_names, co_names] = extractBlifCioNames(blif_file);
+
+  logger_->report("[INFO RMP-TDLY] BLIF boundary nets: {} CI, {} CO, or_timing_ entries={}",
+                  ci_names.size(), co_names.size(), static_cast<int>(or_timing_.size()));
 }
 
 bool Restructure::readAbcLog(const std::string& abc_file_name,

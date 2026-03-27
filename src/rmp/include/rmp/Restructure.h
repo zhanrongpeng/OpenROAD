@@ -20,6 +20,9 @@
 #include "sta/NetworkClass.hh"
 #include "utl/unique_name.h"
 
+#include "base/abc/abc.h"
+#include "base/main/abcapis.h"
+
 namespace abc {
 }  // namespace abc
 
@@ -170,7 +173,23 @@ class Restructure
   void runABC();
   void postABC(float worst_slack);
   bool writeAbcScript(const std::string& file_name);
-  void writeOptCommands(std::ofstream& script);
+  void writeOptCommands(const std::string& file_name);
+  // Writes the setup portion of the ABC script: read_lib + read_blif + strash + read_coords.
+  // map and write_blif are executed separately in runABC() so that timing can be
+  // injected via C++ API between strash/read_coords and map.
+  void writeAbcScriptSetup(const std::string& file_name);
+  // abc_frame is the Abc_Frame_t* returned by Abc_FrameGetGlobalFrame().
+  // Declared as void* to avoid pulling in abc/main.h (which conflicts with sclLib.h).
+  void injectTimingToAbc(void* abc_frame);
+  // Extract CI (input) and CO (output) names from the BLIF file written by writeBlif.
+  // Returns: {CI_names, CO_names} in the same order as ABC's Abc_NtkCollectCioNames.
+  // This is used to build the name mapping between BLIF net names and ABC PI/CO names.
+  std::pair<std::vector<std::string>, std::vector<std::string>>
+  extractBlifCioNames(const std::string& blif_file);
+  // Extract CI/CO names from BLIF for logging only.
+  // Actual timing in or_timing_ was already populated in Restructure::run()
+  // from blif_.getArrivals() / blif_.getRequireds() before writeBlif destroyed path_insts_.
+  void precomputeBoundaryTimingForBlif(const std::string& blif_file);
   void writeNetCoordinates(const std::string& file_name);
   void initDB();
   void getEndPoints(sta::PinSet& ends, bool area_mode, unsigned max_depth);
@@ -214,6 +233,11 @@ class Restructure
   // Wire RC passed directly from OpenROAD to ABC (ohm/um and fF/um)
   double wire_r_per_um_ = 0.0;
   double wire_c_per_um_ = 0.0;
+
+  // Pre-computed timing at cone boundary nets: net_name → {arrival_ns, required_ns}
+  // Populated in Restructure::run() from blif_.getArrivals() / blif_.getRequireds()
+  // BEFORE writeBlif destroys path_insts_. Keys are BLIF net names (== ABC PI/CO names after strash).
+  std::map<std::string, std::pair<double, double>> or_timing_;
 
   Mode opt_mode_{Mode::DELAY_1};
   bool is_area_mode_{false};

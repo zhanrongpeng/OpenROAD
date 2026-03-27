@@ -26,3 +26,6 @@ source ./results/s359320ord_abc_script.tcl
 source ./results/s359321ord_abc_script.tcl
 source ./results/s359322ord_abc_script.tcl
 source ./results/s359323ord_abc_script.tcl
+source ./results/s35932_0_ord_abc_script.tcl
+source ./results/s35932_1_ord_abc_script.tcl
+source ./results/s35932_2_ord_abc_script.tcl
